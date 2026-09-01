@@ -4,6 +4,12 @@ All notable changes to OrderBell are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-02
+
+### Security
+
+- Replaced the dynamic regular expression in the redundant Admin order URL boundary with an exact canonical-origin comparison and a static numeric-ID validator. Store input was already restricted to canonical `myshopify.com` hosts, but the literal comparison removes an incomplete-sanitization warning and remains fail closed if that grammar ever changes.
+
 ## [0.1.0] - 2026-09-02
 
 ### Added
@@ -38,5 +44,6 @@ All notable changes to OrderBell are documented here. The format follows [Keep a
 - Guaranteed child termination and reaping if selector setup fails after a subprocess starts.
 - Updated CI actions to reviewed Node 24 revisions pinned by full commit SHA.
 
-[Unreleased]: https://github.com/tbraxa/omarchy-orderbell/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/tbraxa/omarchy-orderbell/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/tbraxa/omarchy-orderbell/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/tbraxa/omarchy-orderbell/releases/tag/v0.1.0

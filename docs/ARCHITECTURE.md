@@ -2,7 +2,7 @@
 
 ## Scope
 
-OrderBell `0.1.0` is one Omarchy service plus one bar widget backed by a short-lived local worker. It reads recent Shopify orders, determines which are newly observed, keeps minimal durable delivery state, and asks Omarchy to show notifications. It does not run a separate daemon or receive inbound traffic.
+OrderBell `0.1.1` is one Omarchy service plus one bar widget backed by a short-lived local worker. It reads recent Shopify orders, determines which are newly observed, keeps minimal durable delivery state, and asks Omarchy to show notifications. It does not run a separate daemon or receive inbound traffic.
 
 ```text
 Omarchy shell (long-lived)
@@ -139,7 +139,7 @@ The UI uses Omarchy native components and semantic tokens for background, foregr
 
 The compact layer answers three questions: is polling healthy, are there unread orders, and when was the last successful check? Pending delivery also activates the bar so a queued alert cannot look “all caught up.” The panel adds recent sanitized orders and recovery guidance without exposing customer PII. It shows Shopify's sanitized shop name as the friendly label and the canonical domain separately so presentation never obscures identity. With privacy mode enabled (the default), both the panel and per-order notifications hide order name/number and amount while retaining store and status context. Burst notifications always contain only the shop label (or canonical-domain fallback) and count. Normal alerts request Omarchy's maximum 30-second toast lifetime, respect DND, enter Omarchy history, and never retry merely because human attention cannot be proven; the durable unread badge is the persistent fallback.
 
-## Future webhook relay (not in 0.1.0)
+## Future webhook relay (not in 0.1.1)
 
 True push delivery requires a public HTTPS receiver. A future architecture would be a separate, opt-in product:
 
@@ -153,4 +153,4 @@ Shopify orders/create webhook
 
 It would require Shopify app OAuth/review, protected-customer-data analysis, key rotation, tenant isolation, replay protection, deletion/retention controls, operational monitoring, incident response, and a documented service operator. Webhooks alone cannot replace reconciliation because delivery can be duplicated, delayed, or missed.
 
-None of that code, infrastructure, authentication, or network traffic exists in `0.1.0`. It must not be silently added behind the local plugin's settings.
+None of that code, infrastructure, authentication, or network traffic exists in `0.1.1`. It must not be silently added behind the local plugin's settings.

@@ -6,7 +6,7 @@ OrderBell is an unofficial, read-only Omarchy plugin that checks Shopify for new
 
 ![OrderBell setup panel](preview.png)
 
-## What version 0.1.0 does
+## What version 0.1.1 does
 
 - Polls one or more stores through the official Shopify CLI, using the GraphQL Admin API version `2026-07`.
 - Requests only the `read_orders` scope.
@@ -22,13 +22,13 @@ OrderBell does **not** edit orders, fulfill orders, manage themes, run an inboun
 
 ## Local polling, not a webhook service
 
-The implemented `0.1.0` architecture is local polling. While the plugin is enabled and the desktop session is running, it checks each configured store every 60 seconds by default. A notification can therefore arrive up to one polling interval after Shopify records the order; it will wait longer while the notebook is asleep, offline, or logged out.
+The implemented `0.1.1` architecture is local polling. While the plugin is enabled and the desktop session is running, it checks each configured store every 60 seconds by default. A notification can therefore arrive up to one polling interval after Shopify records the order; it will wait longer while the notebook is asleep, offline, or logged out.
 
 Each check starts the official Shopify CLI as a short-lived process. There is no permanent OrderBell worker, but CLI startup can create a brief CPU and memory burst. On a resource-sensitive notebook, increasing **Check every** to 120–300 seconds reduces that work proportionally in exchange for the same additional notification latency.
 
 Each poll covers one explicit inclusive UTC window. Normal checks include a five-minute overlap; catch-up advances the durable watermark in chunks of at most six hours. A committed gap- or backward-clock-recovery chunk reports `catching_up` and asks the service to poll again after 60 seconds unless a notification-delivery problem takes precedence as `degraded`; the following ordinary current-time poll can return to `ok`. Every chunk is limited to 20 pages of 100 orders. OrderBell refuses to advance its watermark if Shopify indicates more data than that cap, or if the saved watermark is more than 59 days behind. This keeps the plugin inside Shopify's ordinary `read_orders` history boundary without requesting `read_all_orders`, but it also means very long outages or unusually dense six-hour windows require operator review rather than a silent best-effort skip.
 
-A future real-time edition could use a separately deployed, authenticated webhook relay with HMAC verification, durable deduplication, and reconciliation polling. That relay is **not implemented, bundled, contacted, or required** by this release. See [Architecture](docs/ARCHITECTURE.md#future-webhook-relay-not-in-010).
+A future real-time edition could use a separately deployed, authenticated webhook relay with HMAC verification, durable deduplication, and reconciliation polling. That relay is **not implemented, bundled, contacted, or required** by this release. See [Architecture](docs/ARCHITECTURE.md#future-webhook-relay-not-in-011).
 
 ## Requirements
 
@@ -219,6 +219,7 @@ The implementation, review boundaries, and release gates are intentionally publi
 - [Data map](docs/DATA_MAP.md)
 - [Test plan](docs/TEST_PLAN.md)
 - [Release checklist](docs/RELEASE_CHECKLIST.md)
+- [0.1.1 release evidence](docs/RELEASE_EVIDENCE_0.1.1.md)
 - [0.1.0 release evidence](docs/RELEASE_EVIDENCE_0.1.0.md)
 - [Contributing](CONTRIBUTING.md)
 

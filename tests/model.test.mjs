@@ -323,13 +323,30 @@ test("remote order URLs require the exact worker form before canonical reconstru
   "https://north-star.myshopify.com/admin/orders/42")
   for (const invalid of [
     "https://evil.myshopify.com/admin/orders/123",
+    "https://north-starXmyshopifyXcom/admin/orders/42",
+    "https://north-star.myshopify.com.evil.example/admin/orders/42",
+    "https://north-star.myshopify.com@evil.example/admin/orders/42",
+    "http://north-star.myshopify.com/admin/orders/42",
+    "https://north-star.myshopify.com:443/admin/orders/42",
     "javascript:alert(1)",
     "https://admin.shopify.com/store/north-star/orders/42",
     "https://north-star.myshopify.com/admin/orders/42#anything",
+    "https://north-star.myshopify.com/admin/orders/42?anything",
     "https://north-star.myshopify.com/admin/orders/42/",
+    "https://north-star.myshopify.com/admin/orders/+42",
+    "https://north-star.myshopify.com/admin/orders/%32",
+    "https://north-star.myshopify.com/admin/orders/４２",
     "https://north-star.myshopify.com/admin/orders/042",
+    "https://north-star.myshopify.com/admin/orders/42\nhttps://evil.example",
+    "https://north-star.myshopify.com/admin/orders/42\u0000",
     `https://north-star.myshopify.com/admin/orders/${"1".repeat(31)}`
   ]) assert.equal(Model.canonicalOrderUrl("north-star.myshopify.com", invalid), "", invalid)
+  for (const invalidStore of [
+    "north-star\\.myshopify.com",
+    "north.*.myshopify.com",
+    "north|south.myshopify.com"
+  ]) assert.equal(Model.canonicalOrderUrl(invalidStore,
+    "https://north-star.myshopify.com/admin/orders/42"), "", invalidStore)
 })
 
 test("oversized output is rejected before JSON parsing", () => {

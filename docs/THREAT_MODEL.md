@@ -4,7 +4,7 @@
 
 This model uses assets, trust boundaries, abuse cases, and explicit residual risks. Its objective is narrow: notify an authenticated desktop user about newly observed orders without granting write access, handling a Shopify token, persisting customer PII, or turning remote/user-controlled values into code or arbitrary URLs.
 
-The model applies to OrderBell `0.1.0` running under an ordinary user in an Omarchy 4 session. It must be revisited for every new data field, executable, permission, network destination, dependency, or webhook feature.
+The model applies to OrderBell `0.1.1` running under an ordinary user in an Omarchy 4 session. It must be revisited for every new data field, executable, permission, network destination, dependency, or webhook feature.
 
 ## Assets
 

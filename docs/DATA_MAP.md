@@ -1,6 +1,6 @@
 # Data Map
 
-This inventory is normative for `0.1.0`. A field or destination not listed here must not be introduced without updating the privacy notice, threat model, tests, and release review.
+This inventory is normative for `0.1.1`. A field or destination not listed here must not be introduced without updating the privacy notice, threat model, tests, and release review.
 
 | Location / flow | Data | Purpose | Protection / retention |
 | --- | --- | --- | --- |

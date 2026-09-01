@@ -1,6 +1,6 @@
 # Release Checklist
 
-This checklist is a gate, not a claim that publication is complete. `0.1.0` remains unpublished until every applicable item has dated, commit-bound evidence, the final release commit is tagged, and a human release owner approves it.
+This checklist is a gate, not a claim that publication is complete. The version named by `manifest.json` remains unpublished until every applicable item has dated, commit-bound evidence, the final release commit is tagged, and a human release owner approves it.
 
 ## 1. Identity and scope
 
@@ -66,10 +66,10 @@ This checklist is a gate, not a claim that publication is complete. `0.1.0` rema
 ## 7. Release and marketplace preparation
 
 - [ ] README installation/removal, limitations, local polling, and future webhook boundary are accurate.
-- [ ] The final release commit has a dated `0.1.0` changelog section, an empty `Unreleased` section, and the maintainer's ISO release date.
+- [ ] The final release commit has a dated changelog section matching the manifest version, an empty `Unreleased` section, and the maintainer's ISO release date.
 - [ ] Public GitHub repository root contains one plugin, manifest, README, license, and optional reviewed `preview.png`.
 - [ ] Preview contains only synthetic data and no Shopify logo/customer/store/order information.
-- [ ] Tag `v0.1.0` points to the reviewed commit; release notes include security/privacy boundaries and known limitations.
+- [ ] The SemVer tag matching the manifest version points to the reviewed commit; release notes include security/privacy boundaries and known limitations.
 - [ ] Marketplace ID availability is rechecked immediately before submission.
 - [ ] Proposed marketplace category is `Productivity`; proposed tags are `bar` and `quickshell` (subject to current allowed values).
 - [ ] Owner reviews the marketplace submission body and explicitly confirms every ownership/checklist statement before any issue is created.

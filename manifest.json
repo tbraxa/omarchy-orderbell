@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.tbraxa.orderbell",
   "name": "OrderBell",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Tomas / tbraxa",
   "description": "Privacy-first, read-only Shopify order alerts in the Omarchy bar.",
   "homepage": "https://github.com/tbraxa/omarchy-orderbell",

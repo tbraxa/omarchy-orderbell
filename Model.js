@@ -286,9 +286,13 @@ function numericOrderIdFromUrl(store, value) {
   if (validStore === "" || typeof value !== "string" || value.length > 512)
     return ""
 
-  var escapedStore = validStore.replace(/\./g, "\\.")
-  var legacy = value.match(new RegExp("^https://" + escapedStore + "/admin/orders/([1-9][0-9]{0,29})$"))
-  return legacy ? legacy[1] : ""
+  // Compare the already validated canonical origin literally. Keeping remote
+  // text out of a RegExp makes this second URL trust boundary unambiguous even
+  // if the store grammar is extended in the future.
+  var prefix = "https://" + validStore + "/admin/orders/"
+  if (value.substring(0, prefix.length) !== prefix) return ""
+  var legacy = value.substring(prefix.length)
+  return /^[1-9][0-9]{0,29}$/.test(legacy) ? legacy : ""
 }
 
 function canonicalOrderUrl(store, value) {
