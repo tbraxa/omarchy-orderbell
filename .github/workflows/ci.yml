@@ -1,0 +1,302 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orderbell-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Worker, model, QML, manifest, docs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify runner toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          if sys.version_info < (3, 11):
+              raise SystemExit("OrderBell requires Python 3.11 or newer")
+          PY
+          node -e 'const major = Number(process.versions.node.split(".")[0]); if (major < 20) process.exit(1)'
+          python3 --version
+          node --version
+
+      - name: Install deterministic Qt test runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            qt6-declarative-dev-tools \
+            qml6-module-qtqml \
+            qml6-module-qtqml-models \
+            qml6-module-qtqml-workerscript \
+            qml6-module-qtquick \
+            qml6-module-qtquick-controls \
+            qml6-module-qtquick-layouts \
+            qml6-module-qtquick-templates \
+            qml6-module-qtquick-window \
+            qml6-module-qttest
+
+      - name: Compile and test the Python worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m compileall -q bin tests
+          python3 -m unittest discover -s tests -p 'test_worker*.py'
+
+      - name: Test the JavaScript model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tests_found < <(find tests -maxdepth 1 -type f \( -name '*.test.js' -o -name '*.test.mjs' \) -print | sort)
+          if (( ${#tests_found[@]} == 0 )); then
+            echo 'No JavaScript model tests were found.' >&2
+            exit 1
+          fi
+          node --test "${tests_found[@]}"
+
+      - name: Parse and test QML
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t qml_files < <(find . -type f -name '*.qml' -not -path './.git/*' -print | sort)
+          if (( ${#qml_files[@]} == 0 )); then
+            echo 'No QML files were found.' >&2
+            exit 1
+          fi
+          for qml in "${qml_files[@]}"; do
+            /usr/lib/qt6/bin/qmlformat "$qml" >/dev/null
+          done
+          tests/run-qml
+
+      - name: Validate manifest and repository shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path, PurePosixPath
+
+          root = Path.cwd()
+          manifest_path = root / "manifest.json"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+          expected = {
+              "schemaVersion": 1,
+              "id": "io.github.tbraxa.orderbell",
+              "name": "OrderBell",
+              "author": "Tomas / tbraxa",
+              "license": "MIT",
+              "keepLoaded": True,
+          }
+          for key, value in expected.items():
+              if manifest.get(key) != value or isinstance(manifest.get(key), bool) != isinstance(value, bool):
+                  raise SystemExit(f"manifest field {key!r} must be {value!r}")
+
+          if not isinstance(manifest.get("version"), str) or not re.fullmatch(
+              r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", manifest["version"]
+          ):
+              raise SystemExit("manifest version is not a plain SemVer release")
+          changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+          if f"## [{manifest['version']}]" not in changelog:
+              raise SystemExit("manifest version has no changelog section")
+          if set(manifest.get("kinds", [])) != {"service", "bar-widget"}:
+              raise SystemExit("manifest must declare exactly service and bar-widget")
+
+          entry_points = manifest.get("entryPoints")
+          if entry_points != {"service": "Service.qml", "barWidget": "BarWidget.qml"}:
+              raise SystemExit("manifest entry points changed unexpectedly")
+          for relative in entry_points.values():
+              pure = PurePosixPath(relative)
+              if pure.is_absolute() or ".." in pure.parts or not (root / relative).is_file():
+                  raise SystemExit(f"unsafe or missing entry point: {relative}")
+
+          widget = manifest.get("barWidget")
+          if not isinstance(widget, dict) or widget.get("allowMultiple") is not False:
+              raise SystemExit("OrderBell must be a single-instance bar widget")
+          if widget.get("defaultSection") != "right":
+              raise SystemExit("unexpected default bar section")
+          defaults = widget.get("defaults")
+          required_defaults = {
+              "stores": "",
+              "refreshIntervalSec": 60,
+              "privacyMode": True,
+              "includeTestOrders": False,
+              "notify": True,
+          }
+          if defaults != required_defaults:
+              raise SystemExit("manifest defaults do not match the supported settings contract")
+          schema = widget.get("schema")
+          if not isinstance(schema, list) or {item.get("key") for item in schema if isinstance(item, dict)} != set(required_defaults):
+              raise SystemExit("manifest setting schema does not match its defaults")
+          interval = next(item for item in schema if item.get("key") == "refreshIntervalSec")
+          if interval.get("min") != 60 or interval.get("max") != 3600:
+              raise SystemExit("polling interval bounds changed unexpectedly")
+
+          required_files = {
+              "README.md", "LICENSE", "SECURITY.md", "PRIVACY.md",
+              "CHANGELOG.md", "CONTRIBUTING.md", "graphql/orders.graphql",
+              "bin/orderbell-worker", "docs/ARCHITECTURE.md",
+              "docs/THREAT_MODEL.md", "docs/DATA_MAP.md", "docs/TEST_PLAN.md",
+              "docs/RELEASE_CHECKLIST.md", "docs/WORKER_PROTOCOL.md", "tests/run-qml",
+          }
+          missing = sorted(path for path in required_files if not (root / path).is_file())
+          if missing:
+              raise SystemExit("missing required repository files: " + ", ".join(missing))
+          for executable in (root / "bin/orderbell-worker", root / "tests/run-qml"):
+              if not executable.stat().st_mode & 0o111:
+                  raise SystemExit(f"required executable bit is missing: {executable.relative_to(root)}")
+
+          links = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+          for document in [root / "README.md", root / "SECURITY.md", root / "PRIVACY.md", root / "CONTRIBUTING.md", *sorted((root / "docs").glob("*.md"))]:
+              text = document.read_text(encoding="utf-8")
+              for target in links.findall(text):
+                  clean = target.split("#", 1)[0]
+                  if not clean or "://" in clean or clean.startswith("mailto:"):
+                      continue
+                  resolved = (document.parent / clean).resolve()
+                  if root.resolve() not in (resolved, *resolved.parents) or not resolved.exists():
+                      raise SystemExit(f"broken or escaping link in {document}: {target}")
+
+          for path in root.rglob("*"):
+              if ".git" in path.parts:
+                  continue
+              if path.is_symlink():
+                  raise SystemExit(f"symlinks are not permitted: {path.relative_to(root)}")
+          PY
+
+      - name: Validate QML source safety and syntax structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          root = Path.cwd()
+          required = {"Service.qml", "BarWidget.qml", "Panel.qml"}
+          present = {path.name for path in root.glob("*.qml")}
+          if not required <= present:
+              raise SystemExit("missing required QML source: " + ", ".join(sorted(required - present)))
+          qml_runner = root / "tests" / "run-qml"
+          if not qml_runner.is_file() or not (qml_runner.stat().st_mode & 0o111):
+              raise SystemExit("tests/run-qml must exist and be executable")
+
+          def structural_check(path: Path) -> None:
+              data = path.read_text(encoding="utf-8")
+              if "\x00" in data or len(data.encode("utf-8")) > 512 * 1024:
+                  raise SystemExit(f"unsafe QML source size/content: {path}")
+              if re.search(r"#[0-9A-Fa-f]{3,8}\b", data):
+                  raise SystemExit(f"hard-coded color found; use Omarchy semantic tokens: {path}")
+              if re.search(r"https?://", data):
+                  raise SystemExit(f"network/URL literal belongs in the validated worker, not QML: {path}")
+
+              pairs = {"(": ")", "[": "]", "{": "}"}
+              closing = {value: key for key, value in pairs.items()}
+              stack = []
+              i = 0
+              quote = None
+              escaped = False
+              regex_mode = False
+              regex_class = False
+              line_comment = False
+              block_comment = False
+              while i < len(data):
+                  char = data[i]
+                  nxt = data[i + 1] if i + 1 < len(data) else ""
+                  if line_comment:
+                      if char == "\n":
+                          line_comment = False
+                  elif block_comment:
+                      if char == "*" and nxt == "/":
+                          block_comment = False
+                          i += 1
+                  elif regex_mode:
+                      if escaped:
+                          escaped = False
+                      elif char == "\\":
+                          escaped = True
+                      elif char == "[":
+                          regex_class = True
+                      elif char == "]":
+                          regex_class = False
+                      elif char == "/" and not regex_class:
+                          regex_mode = False
+                  elif quote is not None:
+                      if escaped:
+                          escaped = False
+                      elif char == "\\":
+                          escaped = True
+                      elif char == quote:
+                          quote = None
+                  elif char == "/" and nxt == "/":
+                      line_comment = True
+                      i += 1
+                  elif char == "/" and nxt == "*":
+                      block_comment = True
+                      i += 1
+                  elif char == "/" and nxt not in "/*":
+                      previous = ""
+                      j = i - 1
+                      while j >= 0 and data[j].isspace():
+                          j -= 1
+                      if j < 0 or data[j] in "(=:[,!&|?;{}":
+                          regex_mode = True
+                          regex_class = False
+                  elif char in "\"'`":
+                      quote = char
+                  elif char in pairs:
+                      stack.append((char, i))
+                  elif char in closing:
+                      if not stack or stack[-1][0] != closing[char]:
+                          raise SystemExit(f"unbalanced {char!r} in {path} at byte {i}")
+                      stack.pop()
+                  i += 1
+              if quote is not None or regex_mode or block_comment or stack:
+                  raise SystemExit(f"unterminated string/comment/delimiter in {path}")
+              if not re.search(r"(?m)^import\s+QtQuick(?:\s|$)", data):
+                  raise SystemExit(f"QML source has no explicit QtQuick import: {path}")
+
+          for qml in sorted(root.glob("*.qml")):
+              structural_check(qml)
+
+          widget = (root / "BarWidget.qml").read_text(encoding="utf-8")
+          panel = (root / "Panel.qml").read_text(encoding="utf-8")
+          if 'moduleName: "io.github.tbraxa.orderbell"' not in widget:
+              raise SystemExit("BarWidget moduleName must equal the permanent manifest id")
+          if 'ipcTarget: "io.github.tbraxa.orderbell"' not in panel:
+              raise SystemExit("Panel ipcTarget must equal the permanent manifest id")
+          if "import qs.Commons" not in widget or "import qs.Ui" not in widget:
+              raise SystemExit("BarWidget must use Omarchy's semantic component modules")
+          PY
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Scan for committed secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

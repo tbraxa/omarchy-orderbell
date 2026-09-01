@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.log
+.coverage
+.pytest_cache/
+.ruff_cache/
+.idea/
+.vscode/
+.DS_Store
+node_modules/
+coverage/
+dist/
+build/
+*.swp
+*.swo
+*~
+
+# Local test and development output
+.tmp/
+test-results/
+
+# Never commit credentials or local state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+access-token*
+refresh-token*
+shopify-token*

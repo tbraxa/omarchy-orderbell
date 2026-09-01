@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Deterministic fake for OrderBell worker tests."""
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def append_log() -> None:
+    destination = os.environ.get("ORDERBELL_FAKE_SHOPIFY_LOG")
+    if destination:
+        with Path(destination).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sys.argv[1:], separators=(",", ":")) + "\n")
+
+
+def record_pid() -> None:
+    destination = os.environ.get("ORDERBELL_FAKE_SHOPIFY_PID_FILE")
+    if destination:
+        Path(destination).write_text(str(os.getpid()), encoding="ascii")
+
+
+def emit(spec: dict) -> int:
+    delay = spec.get("sleep", 0)
+    if delay:
+        time.sleep(float(delay))
+    spam = spec.get("spamStdoutBytes")
+    if spam:
+        remaining = int(spam)
+        chunk = b"x" * 65536
+        while remaining:
+            part = chunk[:remaining]
+            sys.stdout.buffer.write(part)
+            sys.stdout.buffer.flush()
+            remaining -= len(part)
+    elif "rawStdout" in spec:
+        sys.stdout.write(str(spec["rawStdout"]))
+    elif "stdout" in spec:
+        json.dump(spec["stdout"], sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+    if "stderr" in spec:
+        sys.stderr.write(str(spec["stderr"]))
+    if spec.get("replaceStoresWithSymlink"):
+        state_home = Path(os.environ["XDG_STATE_HOME"])
+        stores = state_home / "orderbell" / "stores"
+        backup = Path(os.environ["ORDERBELL_FAKE_STATE_BACKUP"])
+        target = Path(os.environ["ORDERBELL_FAKE_STATE_SYMLINK_TARGET"])
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        stores.rename(backup)
+        stores.symlink_to(target, target_is_directory=True)
+    return int(spec.get("exitCode", 0))
+
+
+def option(name: str) -> str | None:
+    try:
+        return sys.argv[sys.argv.index(name) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+append_log()
+record_pid()
+scenario_path = os.environ.get("ORDERBELL_FAKE_SHOPIFY_SCENARIO")
+scenario = {}
+if scenario_path:
+    scenario = json.loads(Path(scenario_path).read_text(encoding="utf-8"))
+
+args = sys.argv[1:]
+if args[:2] == ["store", "auth"]:
+    raise SystemExit(
+        emit(
+            scenario.get(
+                "auth",
+                {
+                    "stdout": {
+                        "store": option("--store"),
+                        "scopes": ["read_orders"],
+                        "associatedUser": {
+                            "email": "private@example.test",
+                            "firstName": "Private",
+                            "lastName": "Person",
+                        },
+                    }
+                },
+            )
+        )
+    )
+
+if args[:2] != ["store", "execute"]:
+    sys.stderr.write("unexpected fake Shopify invocation")
+    raise SystemExit(64)
+
+variables_raw = option("--variables")
+try:
+    variables = json.loads(variables_raw or "{}")
+except json.JSONDecodeError:
+    variables = {}
+after = variables.get("after")
+page_key = "__first__" if after is None else str(after)
+execute = scenario.get("execute", {})
+pages = execute.get("pages", {})
+spec = pages.get(page_key, execute.get("default", {}))
+if not spec:
+    spec = {
+        "stdout": {
+            "data": {
+                "orders": {
+                    "edges": [],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }
+            }
+        }
+    }
+raise SystemExit(emit(spec))

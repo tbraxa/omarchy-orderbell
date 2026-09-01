@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.tbraxa.orderbell",
+  "name": "OrderBell",
+  "version": "0.1.0",
+  "author": "Tomas / tbraxa",
+  "description": "Privacy-first, read-only Shopify order alerts in the Omarchy bar.",
+  "homepage": "https://github.com/tbraxa/omarchy-orderbell",
+  "license": "MIT",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OrderBell",
+    "description": "Read-only order notifications and recent order status for Shopify stores.",
+    "category": "Productivity",
+    "aliases": [
+      "shopify",
+      "orders",
+      "sales",
+      "commerce"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "stores": "",
+      "refreshIntervalSec": 60,
+      "privacyMode": true,
+      "includeTestOrders": false,
+      "notify": true
+    },
+    "schema": [
+      {
+        "key": "stores",
+        "type": "string",
+        "label": "Stores",
+        "defaultValue": "",
+        "description": "Comma-separated canonical myshopify.com domains, for example northwind.myshopify.com. Schemes, paths, ports, and custom storefront domains are rejected."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Check every",
+        "min": 60,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 60,
+        "description": "Seconds between read-only checks. OrderBell clamps the interval to 60–3600 seconds."
+      },
+      {
+        "key": "privacyMode",
+        "type": "boolean",
+        "label": "Hide order details",
+        "defaultValue": true,
+        "description": "Hides the order name/number and amount in the panel and per-order notifications. Store and statuses remain visible; burst notifications always show only store and count. Recommended on shared or visible screens."
+      },
+      {
+        "key": "includeTestOrders",
+        "type": "boolean",
+        "label": "Include test orders",
+        "defaultValue": false,
+        "description": "Include Shopify test orders in the panel, unread count, and notifications. Turning this off clears retained test rows and queued test alerts on the next poll. Keep this off for normal use."
+      },
+      {
+        "key": "notify",
+        "type": "boolean",
+        "label": "Desktop notifications",
+        "defaultValue": true,
+        "description": "Request a 30-second lifetime for Omarchy alerts after the initial baseline. Up to five new orders per poll are delivered individually; larger bursts use a count-only summary."
+      }
+    ]
+  }
+}

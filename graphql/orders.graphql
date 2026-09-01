@@ -1,0 +1,38 @@
+query OrderBellOrders(
+  $first: Int!
+  $after: String
+  $query: String!
+) {
+  shop {
+    name
+  }
+  orders(
+    first: $first
+    after: $after
+    query: $query
+    sortKey: CREATED_AT
+  ) {
+    edges {
+      cursor
+      node {
+        id
+        legacyResourceId
+        name
+        createdAt
+        test
+        displayFinancialStatus
+        displayFulfillmentStatus
+        currentTotalPriceSet {
+          shopMoney {
+            amount
+            currencyCode
+          }
+        }
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}

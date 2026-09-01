@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+runner="${QML_TEST_RUNNER:-}"
+
+if [[ -z "$runner" ]]; then
+  if [[ -x /usr/lib/qt6/bin/qmltestrunner ]]; then
+    runner=/usr/lib/qt6/bin/qmltestrunner
+  else
+    runner="$(command -v qmltestrunner)"
+  fi
+fi
+
+QT_QPA_PLATFORM=offscreen \
+QT_QUICK_BACKEND=software \
+"$runner" \
+  -input "$repo_root/tests/qml" \
+  -import "$repo_root/tests/qml/imports" \
+  -o -,txt

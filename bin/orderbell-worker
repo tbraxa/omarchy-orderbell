@@ -1,0 +1,1979 @@
+#!/usr/bin/env python3
+"""OrderBell's local, read-only Shopify polling worker.
+
+The worker deliberately depends only on Python's standard library.  Shopify
+credentials remain owned by the official Shopify CLI; this process neither
+reads nor persists them.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime as dt
+import decimal
+import errno
+import fcntl
+import hashlib
+import html
+import json
+import os
+import random
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+from pathlib import Path
+from typing import Any, NoReturn, Sequence
+
+
+SCHEMA_VERSION = 1
+API_VERSION = "2026-07"
+OVERLAP = dt.timedelta(minutes=5)
+SEEN_SAFETY_MARGIN = dt.timedelta(minutes=1)
+MAX_CATCHUP_SPAN = dt.timedelta(hours=6)
+MAX_CATCHUP_HORIZON = dt.timedelta(days=59)
+PAGE_SIZE = 100
+MAX_PAGES = 20
+MAX_ORDERS_PER_POLL = PAGE_SIZE * MAX_PAGES
+MAX_RECENT_ORDERS = 20
+MAX_SEEN = 8192
+MAX_OUTBOX = 64
+MAX_INDIVIDUAL_NOTIFICATIONS_PER_POLL = 5
+MAX_NOTIFICATION_ATTEMPTS_PER_RUN = 5
+MAX_NOTIFICATION_ATTEMPTS_PER_ENTRY = 8
+NOTIFICATION_EXPIRE_MS = 30_000
+MAX_STATE_BYTES = 2 * 1024 * 1024
+MAX_CLI_STDOUT = 4 * 1024 * 1024
+MAX_CLI_STDERR = 64 * 1024
+MAX_JSON_OUTPUT = 64 * 1024
+DEFAULT_INTERVAL = 60
+DEFAULT_TIMEOUT = 20
+MAX_ERROR_MESSAGE = 180
+STORE_RE = re.compile(
+    r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.myshopify\.com$"
+)
+ORDER_GID_RE = re.compile(r"^gid://shopify/Order/([1-9][0-9]{0,29})$")
+LEGACY_ID_RE = re.compile(r"^[1-9][0-9]{0,29}$")
+AMOUNT_RE = re.compile(r"^(?:0|[1-9][0-9]{0,14})(?:\.[0-9]{1,6})?$")
+ENUM_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,39}$")
+CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+CURSOR_RE = re.compile(r"^[\x21-\x7e]{1,2048}$")
+
+
+class WorkerError(Exception):
+    """A bounded, user-safe failure."""
+
+    def __init__(self, code: str, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.code = code
+        self.safe_message = sanitize_text(message, MAX_ERROR_MESSAGE) or "OrderBell failed safely."
+        self.retryable = retryable
+
+
+class UsageError(WorkerError):
+    def __init__(self, message: str):
+        super().__init__("usage", message, retryable=False)
+
+
+class BusyError(WorkerError):
+    def __init__(self):
+        super().__init__("busy", "A poll for this store is already running.", retryable=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class CommandResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+@dataclasses.dataclass(frozen=True)
+class Options:
+    command: str
+    store: str
+    notify: bool = False
+    privacy: bool = True
+    include_test_orders: bool = False
+    timeout: int = DEFAULT_TIMEOUT
+    interval: int = DEFAULT_INTERVAL
+
+
+@dataclasses.dataclass(frozen=True)
+class FetchedOrder:
+    gid: str
+    gid_hash: str
+    legacy_id: str
+    created_at: str
+    created_dt: dt.datetime
+    public: dict[str, Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class PollWindow:
+    since: dt.datetime
+    until: dt.datetime
+    catching_up: bool
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def iso_utc(value: dt.datetime) -> str:
+    value = value.astimezone(dt.timezone.utc)
+    rendered = value.isoformat(timespec="microseconds")
+    if rendered.endswith(".000000+00:00"):
+        rendered = rendered.replace(".000000+00:00", "Z")
+    elif rendered.endswith("+00:00"):
+        rendered = rendered[:-6] + "Z"
+    return rendered
+
+
+def parse_timestamp(
+    value: Any,
+    *,
+    field: str = "timestamp",
+    state: bool = False,
+) -> tuple[dt.datetime, str]:
+    error_code = "state_corrupt" if state else "malformed_response"
+    message = (
+        f"OrderBell state contains an invalid {field}."
+        if state
+        else f"Shopify returned an invalid {field}."
+    )
+    if not isinstance(value, str) or not (20 <= len(value) <= 40):
+        raise WorkerError(error_code, message, retryable=not state)
+    try:
+        parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except (ValueError, OverflowError) as exc:
+        raise WorkerError(error_code, message, retryable=not state) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise WorkerError(error_code, message, retryable=not state)
+    try:
+        parsed = parsed.astimezone(dt.timezone.utc)
+    except (ValueError, OverflowError) as exc:
+        raise WorkerError(error_code, message, retryable=not state) from exc
+    if parsed.year < 2000 or parsed.year > 9998:
+        raise WorkerError(error_code, message, retryable=not state)
+    return parsed, iso_utc(parsed)
+
+
+def sanitize_text(value: Any, limit: int = 80) -> str:
+    """Make hostile remote text safe for a compact plain-text UI."""
+    if not isinstance(value, str):
+        return ""
+    normalized = unicodedata.normalize("NFKC", value)
+    chars: list[str] = []
+    for char in normalized:
+        category = unicodedata.category(char)
+        if category.startswith("C") or char in "\r\n\t":
+            chars.append(" ")
+        else:
+            chars.append(char)
+    return " ".join("".join(chars).split())[:limit]
+
+
+def notification_body_text(value: Any, limit: int = 160) -> str:
+    """Encode bounded plain text for Omarchy's StyledText notification body."""
+    return html.escape(sanitize_text(value, limit), quote=True)
+
+
+def _validate_display_name(value: Any, *, state: bool = False) -> str:
+    """Return the bounded canonical label safe for UI and notifications."""
+    error_code = "state_corrupt" if state else "malformed_response"
+    source = "OrderBell state" if state else "Shopify"
+    # Bound work before normalization while still allowing substantially more
+    # input than the 64-character label we retain.
+    input_limit = 64 if state else 1024
+    if not isinstance(value, str) or len(value) > input_limit:
+        raise WorkerError(error_code, f"{source} contains an invalid shop name.", retryable=not state)
+    display_name = sanitize_text(value, 64)
+    if not display_name or (state and display_name != value):
+        raise WorkerError(error_code, f"{source} contains an invalid shop name.", retryable=not state)
+    return display_name
+
+
+def validate_store(value: Any) -> str:
+    if not isinstance(value, str) or not STORE_RE.fullmatch(value):
+        raise WorkerError(
+            "invalid_store",
+            "Store must be a canonical lowercase subdomain ending in .myshopify.com.",
+            retryable=False,
+        )
+    return value
+
+
+def store_key(store: str) -> str:
+    return hashlib.sha256(store.encode("ascii")).hexdigest()
+
+
+def order_url(store: str, legacy_id: str | None = None) -> str:
+    store = validate_store(store)
+    if legacy_id is None:
+        return f"https://{store}/admin/orders"
+    if not LEGACY_ID_RE.fullmatch(legacy_id):
+        raise WorkerError("malformed_response", "Shopify returned an invalid order identifier.", retryable=True)
+    return f"https://{store}/admin/orders/{legacy_id}"
+
+
+def _usage() -> str:
+    return (
+        "Usage: orderbell-worker poll --store SHOP.myshopify.com "
+        "[--notify|--no-notify] [--privacy|--show-details] "
+        "[--include-test-orders] [--timeout 20] [--interval 60]; "
+        "or status|mark-read|authenticate|test-notification --store SHOP.myshopify.com"
+    )
+
+
+def _int_option(value: str, name: str, minimum: int, maximum: int) -> int:
+    if not re.fullmatch(r"[0-9]{1,5}", value):
+        raise UsageError(f"{name} must be an integer from {minimum} to {maximum}.")
+    number = int(value)
+    if not minimum <= number <= maximum:
+        raise UsageError(f"{name} must be an integer from {minimum} to {maximum}.")
+    return number
+
+
+def parse_cli(argv: Sequence[str]) -> Options:
+    if not argv or argv[0] in {"-h", "--help", "help"}:
+        raise UsageError(_usage())
+    command = argv[0]
+    if command not in {"poll", "status", "mark-read", "authenticate", "test-notification"}:
+        raise UsageError(_usage())
+
+    store: str | None = None
+    notify = False
+    privacy = True
+    include_test_orders = False
+    timeout = 300 if command == "authenticate" else DEFAULT_TIMEOUT
+    interval = DEFAULT_INTERVAL
+    index = 1
+    seen_flags: set[str] = set()
+    while index < len(argv):
+        flag = argv[index]
+        if flag in {"-h", "--help"}:
+            raise UsageError(_usage())
+        if flag in {"--store", "--timeout", "--interval"}:
+            if flag in seen_flags or index + 1 >= len(argv):
+                raise UsageError(f"{flag} requires exactly one value.")
+            seen_flags.add(flag)
+            raw = argv[index + 1]
+            if flag == "--store":
+                store = validate_store(raw)
+            elif flag == "--timeout":
+                timeout = _int_option(raw, "--timeout", 1, 900 if command == "authenticate" else 120)
+            else:
+                interval = _int_option(raw, "--interval", 60, 3600)
+            index += 2
+            continue
+        if flag == "--notify":
+            notify = True
+        elif flag == "--no-notify":
+            notify = False
+        elif flag == "--privacy":
+            privacy = True
+        elif flag == "--show-details":
+            privacy = False
+        elif flag == "--include-test-orders":
+            include_test_orders = True
+        else:
+            raise UsageError("Unknown option. " + _usage())
+        if flag in seen_flags:
+            raise UsageError(f"Option repeated: {flag}.")
+        seen_flags.add(flag)
+        index += 1
+
+    if store is None:
+        raise UsageError("--store is required. " + _usage())
+
+    allowed: dict[str, set[str]] = {
+        "poll": {
+            "--store",
+            "--timeout",
+            "--interval",
+            "--notify",
+            "--no-notify",
+            "--privacy",
+            "--show-details",
+            "--include-test-orders",
+        },
+        "status": {"--store", "--interval"},
+        "mark-read": {"--store", "--interval"},
+        "authenticate": {"--store", "--timeout"},
+        "test-notification": {"--store", "--timeout", "--privacy", "--show-details"},
+    }
+    invalid = seen_flags - allowed[command]
+    if invalid:
+        raise UsageError(f"Option {sorted(invalid)[0]} is not valid for {command}.")
+    if {"--notify", "--no-notify"}.issubset(seen_flags):
+        raise UsageError("Use only one of --notify and --no-notify.")
+    if {"--privacy", "--show-details"}.issubset(seen_flags):
+        raise UsageError("Use only one of --privacy and --show-details.")
+    return Options(command, store, notify, privacy, include_test_orders, timeout, interval)
+
+
+def _assert_absolute(path: Path, label: str) -> None:
+    if not path.is_absolute() or "\x00" in os.fspath(path):
+        raise WorkerError("unsafe_state", f"{label} must be an absolute path.", retryable=False)
+
+
+def _assert_no_symlink_components(path: Path) -> None:
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current = current / component
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            raise WorkerError("unsafe_state", "Refusing a symlinked state or runtime path.", retryable=False)
+
+
+def _ensure_private_dir(path: Path, *, create_parents: bool = True) -> None:
+    _assert_absolute(path, "State path")
+    _assert_no_symlink_components(path)
+    try:
+        path.mkdir(mode=0o700, parents=create_parents, exist_ok=True)
+    except OSError as exc:
+        raise WorkerError(
+            "state_io",
+            "OrderBell could not create its private state directory.",
+            retryable=True,
+        ) from exc
+    _assert_no_symlink_components(path)
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            raise WorkerError("unsafe_state", "The OrderBell state directory is not privately owned.")
+        os.chmod(path, 0o700)
+    except WorkerError:
+        raise
+    except OSError as exc:
+        raise WorkerError("state_io", "OrderBell could not secure its state directory.", retryable=True) from exc
+
+
+def state_paths(store: str) -> tuple[Path, Path]:
+    raw_home = os.environ.get("XDG_STATE_HOME")
+    state_home = Path(raw_home) if raw_home else Path.home() / ".local" / "state"
+    _assert_absolute(state_home, "XDG_STATE_HOME")
+    _assert_no_symlink_components(state_home)
+    try:
+        state_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise WorkerError("state_io", "OrderBell could not access XDG_STATE_HOME.", retryable=True) from exc
+    _assert_no_symlink_components(state_home)
+    root = state_home / "orderbell"
+    stores = root / "stores"
+    _ensure_private_dir(root)
+    _ensure_private_dir(stores, create_parents=False)
+    return stores / f"{store_key(store)}.json", stores
+
+
+def runtime_lock_path(store: str) -> tuple[Path, Path]:
+    raw_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not raw_runtime:
+        candidate = Path(f"/run/user/{os.geteuid()}")
+        if not candidate.is_dir():
+            raise WorkerError("runtime_unavailable", "XDG_RUNTIME_DIR is unavailable.", retryable=True)
+        runtime = candidate
+    else:
+        runtime = Path(raw_runtime)
+    _assert_absolute(runtime, "XDG_RUNTIME_DIR")
+    _assert_no_symlink_components(runtime)
+    try:
+        info = os.lstat(runtime)
+    except OSError as exc:
+        raise WorkerError("runtime_unavailable", "XDG_RUNTIME_DIR is unavailable.", retryable=True) from exc
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise WorkerError("unsafe_state", "XDG_RUNTIME_DIR is not privately owned.", retryable=False)
+    root = runtime / "orderbell"
+    _ensure_private_dir(root, create_parents=False)
+    return root / f"{store_key(store)}.lock", root
+
+
+class StoreLock:
+    def __init__(self, store: str):
+        self.store = store
+        self.fd: int | None = None
+
+    def __enter__(self) -> "StoreLock":
+        path, _ = runtime_lock_path(self.store)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            self.fd = os.open(path, flags, 0o600)
+            info = os.fstat(self.fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+                raise WorkerError("unsafe_state", "The OrderBell lock file is unsafe.")
+            os.fchmod(self.fd, 0o600)
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise BusyError() from exc
+            os.ftruncate(self.fd, 0)
+            os.write(self.fd, f"{os.getpid()}\n".encode("ascii"))
+        except WorkerError:
+            self.__exit__(None, None, None)
+            raise
+        except OSError as exc:
+            self.__exit__(None, None, None)
+            if exc.errno == errno.ELOOP:
+                raise WorkerError("unsafe_state", "Refusing a symlinked lock file.") from exc
+            raise WorkerError("state_io", "OrderBell could not acquire its store lock.", retryable=True) from exc
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+
+def default_state(store: str) -> dict[str, Any]:
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "store": store,
+        "displayName": None,
+        "initialized": False,
+        "watermarkCreatedAt": None,
+        "seen": {},
+        "recentOrders": [],
+        "outbox": [],
+        "unreadCount": 0,
+        "unreadTestCount": 0,
+        "lastSuccessfulPollAt": None,
+        "failureCount": 0,
+    }
+
+
+def _burst_event_id(store: str, test: bool) -> str:
+    marker = "test" if test else "live"
+    return hashlib.sha256(f"orderbell-burst-v1:{store}:{marker}".encode("ascii")).hexdigest()
+
+
+def _validate_public_order(value: Any, store: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise WorkerError("state_corrupt", "OrderBell state contains an invalid order.")
+    required = {
+        "idHash",
+        "name",
+        "createdAt",
+        "amount",
+        "currency",
+        "financialStatus",
+        "fulfillmentStatus",
+        "test",
+        "url",
+        "unread",
+    }
+    if not required.issubset(value):
+        raise WorkerError("state_corrupt", "OrderBell state contains an incomplete order.")
+    result = dict(value)
+    if not isinstance(result["idHash"], str) or not HASH_RE.fullmatch(result["idHash"]):
+        raise WorkerError("state_corrupt", "OrderBell state contains an invalid order hash.")
+    result["name"] = sanitize_text(result["name"], 64)
+    _, result["createdAt"] = parse_timestamp(
+        result["createdAt"],
+        field="order timestamp",
+        state=True,
+    )
+    if not isinstance(result["amount"], str) or not AMOUNT_RE.fullmatch(result["amount"]):
+        raise WorkerError("state_corrupt", "OrderBell state contains an invalid amount.")
+    if not isinstance(result["currency"], str) or not CURRENCY_RE.fullmatch(result["currency"]):
+        raise WorkerError("state_corrupt", "OrderBell state contains an invalid currency.")
+    for key in ("financialStatus", "fulfillmentStatus"):
+        if result[key] is not None and (
+            not isinstance(result[key], str) or not ENUM_RE.fullmatch(result[key])
+        ):
+            raise WorkerError("state_corrupt", "OrderBell state contains an invalid status.")
+    if not isinstance(result["test"], bool) or not isinstance(result["unread"], bool):
+        raise WorkerError("state_corrupt", "OrderBell state contains invalid flags.")
+    expected_prefix = f"https://{store}/admin/orders/"
+    if not isinstance(result["url"], str) or not result["url"].startswith(expected_prefix):
+        raise WorkerError("state_corrupt", "OrderBell state contains an unsafe order URL.")
+    legacy_id = result["url"][len(expected_prefix) :]
+    if result["url"] != order_url(store, legacy_id):
+        raise WorkerError("state_corrupt", "OrderBell state contains an unsafe order URL.")
+    return {key: result[key] for key in required}
+
+
+def validate_state(value: Any, store: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schemaVersion") != SCHEMA_VERSION:
+        raise WorkerError("state_corrupt", "OrderBell state has an unsupported schema.")
+    if value.get("store") != store or not isinstance(value.get("initialized"), bool):
+        raise WorkerError("state_corrupt", "OrderBell state belongs to a different store.")
+    state = default_state(store)
+    state["initialized"] = value["initialized"]
+
+    # displayName was added without changing the schema-v1 number so existing
+    # installations migrate losslessly on their next successful poll.
+    display_name = value.get("displayName")
+    if display_name is not None:
+        display_name = _validate_display_name(display_name, state=True)
+    state["displayName"] = display_name
+
+    watermark = value.get("watermarkCreatedAt")
+    if watermark is not None:
+        _, watermark = parse_timestamp(watermark, field="watermark", state=True)
+    if state["initialized"] and watermark is None:
+        raise WorkerError("state_corrupt", "Initialized OrderBell state has no watermark.")
+    state["watermarkCreatedAt"] = watermark
+
+    seen = value.get("seen")
+    if not isinstance(seen, dict) or len(seen) > MAX_SEEN:
+        raise WorkerError("state_corrupt", "OrderBell deduplication state is invalid.")
+    clean_seen: dict[str, str] = {}
+    for item_hash, created_at in seen.items():
+        if not isinstance(item_hash, str) or not HASH_RE.fullmatch(item_hash):
+            raise WorkerError("state_corrupt", "OrderBell deduplication state is invalid.")
+        _, normalized = parse_timestamp(
+            created_at,
+            field="deduplication timestamp",
+            state=True,
+        )
+        clean_seen[item_hash] = normalized
+    state["seen"] = clean_seen
+
+    recent = value.get("recentOrders")
+    if not isinstance(recent, list) or len(recent) > MAX_RECENT_ORDERS:
+        raise WorkerError("state_corrupt", "OrderBell recent order state is invalid.")
+    state["recentOrders"] = [_validate_public_order(order, store) for order in recent]
+
+    outbox = value.get("outbox")
+    if not isinstance(outbox, list) or len(outbox) > MAX_OUTBOX:
+        raise WorkerError("state_corrupt", "OrderBell notification outbox is invalid.")
+    clean_outbox: list[dict[str, Any]] = []
+    event_ids: set[str] = set()
+    for entry in outbox:
+        if not isinstance(entry, dict):
+            raise WorkerError("state_corrupt", "OrderBell notification outbox is invalid.")
+        # Schema v1 originally omitted the kind discriminator.  Normalize that
+        # exact legacy shape on read so upgrades do not discard durable work.
+        kind = entry.get("kind", "order")
+        if not isinstance(kind, str):
+            raise WorkerError("state_corrupt", "OrderBell notification outbox is invalid.")
+        expected = (
+            {"kind", "eventId", "order", "attempts"}
+            if "kind" in entry
+            else {"eventId", "order", "attempts"}
+        )
+        if kind == "burst":
+            expected = {"kind", "eventId", "count", "test", "url", "attempts"}
+        if set(entry) != expected or kind not in {"order", "burst"}:
+            raise WorkerError("state_corrupt", "OrderBell notification outbox is invalid.")
+        if not isinstance(entry["eventId"], str) or not HASH_RE.fullmatch(entry["eventId"]):
+            raise WorkerError("state_corrupt", "OrderBell notification outbox is invalid.")
+        if entry["eventId"] in event_ids:
+            raise WorkerError("state_corrupt", "OrderBell notification outbox contains duplicate events.")
+        event_ids.add(entry["eventId"])
+        if (
+            not isinstance(entry["attempts"], int)
+            or isinstance(entry["attempts"], bool)
+            or not 0 <= entry["attempts"] <= 1_000_000
+        ):
+            raise WorkerError("state_corrupt", "OrderBell notification outbox is invalid.")
+        if kind == "order":
+            order = _validate_public_order(entry["order"], store)
+            if entry["eventId"] != order["idHash"]:
+                raise WorkerError("state_corrupt", "OrderBell notification outbox is inconsistent.")
+            clean_outbox.append(
+                {
+                    "kind": "order",
+                    "eventId": entry["eventId"],
+                    "order": order,
+                    "attempts": entry["attempts"],
+                }
+            )
+            continue
+        count = entry["count"]
+        test = entry["test"]
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or not 1 <= count <= 2_147_483_647
+            or not isinstance(test, bool)
+            or entry["eventId"] != _burst_event_id(store, test)
+            or entry["url"] != order_url(store)
+        ):
+            raise WorkerError("state_corrupt", "OrderBell notification outbox is inconsistent.")
+        clean_outbox.append(
+            {
+                "kind": "burst",
+                "eventId": entry["eventId"],
+                "count": count,
+                "test": test,
+                "url": entry["url"],
+                "attempts": entry["attempts"],
+            }
+        )
+    state["outbox"] = clean_outbox
+
+    unread = value.get("unreadCount")
+    failures = value.get("failureCount")
+    if not isinstance(unread, int) or isinstance(unread, bool) or not 0 <= unread <= 2_147_483_647:
+        raise WorkerError("state_corrupt", "OrderBell unread count is invalid.")
+    if not isinstance(failures, int) or isinstance(failures, bool) or not 0 <= failures <= 30:
+        raise WorkerError("state_corrupt", "OrderBell retry state is invalid.")
+    state["unreadCount"] = unread
+    unread_tests = value.get("unreadTestCount")
+    if unread_tests is None:
+        # Pre-release schema-v1 state did not split the unread counter. Recover
+        # the largest test count that can be proven from retained local data;
+        # never guess in a way that could subtract live orders.
+        recent_test_unread = sum(
+            1 for order in state["recentOrders"] if order["test"] and order["unread"]
+        )
+        pending_test_unread = 0
+        for entry in state["outbox"]:
+            if _outbox_entry_is_test(entry):
+                pending_test_unread += 1 if entry["kind"] == "order" else entry["count"]
+        unread_tests = min(unread, max(recent_test_unread, pending_test_unread))
+    if (
+        not isinstance(unread_tests, int)
+        or isinstance(unread_tests, bool)
+        or not 0 <= unread_tests <= unread
+    ):
+        raise WorkerError("state_corrupt", "OrderBell test-order unread state is invalid.")
+    state["unreadTestCount"] = unread_tests
+    state["failureCount"] = failures
+
+    last_success = value.get("lastSuccessfulPollAt")
+    if last_success is not None:
+        _, last_success = parse_timestamp(
+            last_success,
+            field="last successful poll",
+            state=True,
+        )
+    state["lastSuccessfulPollAt"] = last_success
+    return state
+
+
+def read_state(store: str) -> dict[str, Any]:
+    path, _ = state_paths(store)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return default_state(store)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise WorkerError("unsafe_state", "Refusing a symlinked state file.") from exc
+        raise WorkerError("state_io", "OrderBell could not read its state.", retryable=True) from exc
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or info.st_mode & 0o077
+        ):
+            raise WorkerError("unsafe_state", "The OrderBell state file is not private.")
+        if info.st_size > MAX_STATE_BYTES:
+            raise WorkerError("state_corrupt", "OrderBell state exceeds its safe size limit.")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, MAX_STATE_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_STATE_BYTES:
+                raise WorkerError("state_corrupt", "OrderBell state exceeds its safe size limit.")
+    finally:
+        os.close(fd)
+    try:
+        parsed = json.loads(b"".join(chunks).decode("utf-8", "strict"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise WorkerError("state_corrupt", "OrderBell state is not valid JSON.") from exc
+    return validate_state(parsed, store)
+
+
+def write_state(store: str, state: dict[str, Any]) -> None:
+    state = validate_state(state, store)
+    path, directory = state_paths(store)
+    try:
+        existing = os.lstat(path)
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:
+        raise WorkerError("state_io", "OrderBell could not inspect its state file.", retryable=True) from exc
+    if existing is not None and (
+        not stat.S_ISREG(existing.st_mode)
+        or existing.st_uid != os.geteuid()
+        or existing.st_nlink != 1
+        or existing.st_mode & 0o077
+    ):
+        raise WorkerError("unsafe_state", "Refusing an unsafe state file.")
+    payload = (json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(payload) > MAX_STATE_BYTES:
+        raise WorkerError("state_too_large", "OrderBell state reached its safe size limit.", retryable=False)
+    fd: int | None = None
+    temporary: str | None = None
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".orderbell-", suffix=".tmp", dir=directory)
+        os.fchmod(fd, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.replace(temporary, path)
+        temporary = None
+        os.chmod(path, 0o600)
+        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except WorkerError:
+        raise
+    except OSError as exc:
+        raise WorkerError("state_io", "OrderBell could not durably save its state.", retryable=True) from exc
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _kill_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+
+
+def command_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    # Prevent ambient flags from replacing our store/query/version or enabling
+    # verbose output. Authentication itself remains in Shopify CLI's own store.
+    for name in list(environment):
+        if name.startswith("SHOPIFY_FLAG_"):
+            del environment[name]
+    environment["SHOPIFY_CLI_NO_ANALYTICS"] = "1"
+    environment["NO_COLOR"] = "1"
+    return environment
+
+
+def run_bounded(
+    argv: Sequence[str],
+    *,
+    timeout: float,
+    max_stdout: int = MAX_CLI_STDOUT,
+    max_stderr: int = MAX_CLI_STDERR,
+) -> CommandResult:
+    if not argv or any(not isinstance(part, str) or "\x00" in part for part in argv):
+        raise WorkerError("internal", "OrderBell refused an unsafe process argument.")
+    try:
+        process = subprocess.Popen(
+            list(argv),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=command_environment(),
+            close_fds=True,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise WorkerError("dependency_missing", f"Required command {argv[0]} is not installed.") from exc
+    except OSError as exc:
+        raise WorkerError("process_failed", f"Required command {argv[0]} could not start.", retryable=True) from exc
+
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    deadline = time.monotonic() + timeout
+    selector: selectors.BaseSelector | None = None
+    try:
+        assert process.stdout is not None and process.stderr is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, ("stdout", max_stdout))
+        selector.register(process.stderr, selectors.EVENT_READ, ("stderr", max_stderr))
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_process(process)
+                process.wait()
+                raise WorkerError("timeout", f"{argv[0]} timed out.", retryable=True)
+            events = selector.select(min(remaining, 0.25))
+            if not events and process.poll() is not None:
+                # Pipes can still have buffered bytes; one non-blocking pass will
+                # either drain them or reach EOF.
+                events = selector.select(0)
+                if not events:
+                    break
+            for key, _ in events:
+                label, limit = key.data
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                buffers[label].extend(chunk)
+                if len(buffers[label]) > limit:
+                    _kill_process(process)
+                    process.wait()
+                    raise WorkerError("output_too_large", f"{argv[0]} produced too much output.", retryable=True)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_process(process)
+            process.wait()
+            raise WorkerError("timeout", f"{argv[0]} timed out.", retryable=True)
+        returncode = process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        _kill_process(process)
+        process.wait()
+        raise WorkerError("timeout", f"{argv[0]} timed out.", retryable=True) from exc
+    except BaseException:
+        # SIGINT is a KeyboardInterrupt and SIGTERM is translated to one by
+        # main().  Always terminate the isolated child process group before the
+        # exception unwinds, otherwise plugin reloads could orphan Shopify CLI.
+        if process.poll() is None:
+            _kill_process(process)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            _kill_process(process)
+            process.wait()
+        raise
+    finally:
+        if selector is not None:
+            try:
+                selector.close()
+            except OSError:
+                pass
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+    return CommandResult(returncode, bytes(buffers["stdout"]), bytes(buffers["stderr"]))
+
+
+def classify_cli_failure(result: CommandResult) -> WorkerError:
+    diagnostic = result.stderr.decode("utf-8", "replace").lower()
+    authentication_terms = (
+        "unauthorized",
+        "not authenticated",
+        "authentication",
+        "log in",
+        "login",
+        "forbidden",
+        "access denied",
+        "invalid session",
+        "missing scope",
+        "401",
+        "403",
+    )
+    if any(term in diagnostic for term in authentication_terms):
+        return WorkerError(
+            "authentication_required",
+            "Shopify authentication is missing, expired, or lacks read_orders.",
+            retryable=False,
+        )
+    if any(term in diagnostic for term in ("throttl", "too many requests", "429")):
+        return WorkerError("throttled", "Shopify temporarily throttled OrderBell.", retryable=True)
+    if any(
+        term in diagnostic
+        for term in (
+            "enotfound",
+            "econn",
+            "network",
+            "dns",
+            "socket",
+            "fetch failed",
+            "offline",
+            "timed out",
+        )
+    ):
+        return WorkerError("offline", "Shopify is temporarily unreachable.", retryable=True)
+    if re.search(r"(?:^|\D)5[0-9]{2}(?:\D|$)", diagnostic) or any(
+        term in diagnostic for term in ("internal server error", "service unavailable", "bad gateway")
+    ):
+        return WorkerError("shopify_unavailable", "Shopify is temporarily unavailable.", retryable=True)
+    return WorkerError("shopify_cli", "Shopify CLI could not complete the read-only query.", retryable=True)
+
+
+def verify_auth_result(payload: bytes, store: str) -> None:
+    """Validate only the non-sensitive claims needed after browser auth."""
+    try:
+        parsed = json.loads(payload.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise WorkerError(
+            "authentication_verification_failed",
+            "Shopify authentication completed without a verifiable JSON result.",
+            retryable=False,
+        ) from exc
+    if not isinstance(parsed, dict) or parsed.get("store") != store:
+        raise WorkerError(
+            "authentication_verification_failed",
+            "Shopify authenticated a different or unverifiable store.",
+            retryable=False,
+        )
+    scopes = parsed.get("scopes")
+    if not isinstance(scopes, list) or len(scopes) > 256:
+        raise WorkerError(
+            "authentication_verification_failed",
+            "Shopify did not return verifiable access scopes.",
+            retryable=False,
+        )
+    clean_scopes: set[str] = set()
+    for item in scopes:
+        if not isinstance(item, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", item):
+            raise WorkerError(
+                "authentication_verification_failed",
+                "Shopify did not return verifiable access scopes.",
+                retryable=False,
+            )
+        clean_scopes.add(item)
+    # Shopify store auth merges scopes previously granted to the same local app.
+    # Extra scopes may therefore appear; read_orders itself is mandatory.
+    if "read_orders" not in clean_scopes:
+        raise WorkerError(
+            "authentication_scope_missing",
+            "Shopify authentication did not grant read_orders.",
+            retryable=False,
+        )
+
+
+def _graphql_root(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise WorkerError("malformed_response", "Shopify returned malformed JSON.", retryable=True)
+    candidate = value
+    if isinstance(candidate.get("result"), dict):
+        candidate = candidate["result"]
+    errors = candidate.get("errors")
+    if errors:
+        codes: set[str] = set()
+        if isinstance(errors, list):
+            for item in errors[:20]:
+                if isinstance(item, dict):
+                    extensions = item.get("extensions")
+                    if isinstance(extensions, dict) and isinstance(extensions.get("code"), str):
+                        codes.add(extensions["code"].upper())
+                    message = item.get("message")
+                    if isinstance(message, str):
+                        lowered = message.lower()
+                        if "access denied" in lowered or "unauthorized" in lowered:
+                            codes.add("ACCESS_DENIED")
+                        if "throttl" in lowered:
+                            codes.add("THROTTLED")
+        if codes & {"ACCESS_DENIED", "UNAUTHORIZED", "FORBIDDEN"}:
+            raise WorkerError(
+                "authentication_required",
+                "Shopify authentication is missing, expired, or lacks read_orders.",
+                retryable=False,
+            )
+        if "THROTTLED" in codes:
+            raise WorkerError("throttled", "Shopify temporarily throttled OrderBell.", retryable=True)
+        raise WorkerError("graphql_error", "Shopify rejected the read-only order query.", retryable=True)
+    if "data" in candidate:
+        candidate = candidate["data"]
+    if not isinstance(candidate, dict):
+        raise WorkerError("malformed_response", "Shopify returned malformed order data.", retryable=True)
+    return candidate
+
+
+def _check_search_warnings(value: Any) -> None:
+    if not isinstance(value, dict):
+        return
+    candidate = value.get("result") if isinstance(value.get("result"), dict) else value
+    extensions = candidate.get("extensions") if isinstance(candidate, dict) else None
+    searches = extensions.get("search") if isinstance(extensions, dict) else None
+    if isinstance(searches, list):
+        for search in searches[:20]:
+            if isinstance(search, dict) and search.get("warnings"):
+                raise WorkerError("search_warning", "Shopify did not accept OrderBell's date filter.", retryable=False)
+
+
+def parse_order_node(value: Any, store: str) -> FetchedOrder:
+    if not isinstance(value, dict):
+        raise WorkerError("malformed_response", "Shopify returned an invalid order.", retryable=True)
+    gid = value.get("id")
+    if not isinstance(gid, str):
+        raise WorkerError("malformed_response", "Shopify returned an invalid order identifier.", retryable=True)
+    gid_match = ORDER_GID_RE.fullmatch(gid)
+    if not gid_match:
+        raise WorkerError("malformed_response", "Shopify returned an invalid order identifier.", retryable=True)
+    legacy_value = value.get("legacyResourceId")
+    if isinstance(legacy_value, int) and not isinstance(legacy_value, bool):
+        legacy_id = str(legacy_value)
+    elif isinstance(legacy_value, str):
+        legacy_id = legacy_value
+    else:
+        legacy_id = ""
+    if not LEGACY_ID_RE.fullmatch(legacy_id) or legacy_id != gid_match.group(1):
+        raise WorkerError("malformed_response", "Shopify returned inconsistent order identifiers.", retryable=True)
+
+    created_dt, created_at = parse_timestamp(value.get("createdAt"), field="order timestamp")
+    name = sanitize_text(value.get("name"), 64)
+    if not name:
+        name = f"#{legacy_id}"
+    if not isinstance(value.get("test"), bool):
+        raise WorkerError("malformed_response", "Shopify returned an invalid test-order flag.", retryable=True)
+
+    money_set = value.get("currentTotalPriceSet")
+    shop_money = money_set.get("shopMoney") if isinstance(money_set, dict) else None
+    amount = shop_money.get("amount") if isinstance(shop_money, dict) else None
+    currency = shop_money.get("currencyCode") if isinstance(shop_money, dict) else None
+    if not isinstance(amount, str) or not AMOUNT_RE.fullmatch(amount):
+        raise WorkerError("malformed_response", "Shopify returned an invalid order amount.", retryable=True)
+    try:
+        parsed_amount = decimal.Decimal(amount)
+    except decimal.InvalidOperation as exc:
+        raise WorkerError("malformed_response", "Shopify returned an invalid order amount.", retryable=True) from exc
+    if not parsed_amount.is_finite() or parsed_amount < 0:
+        raise WorkerError("malformed_response", "Shopify returned an invalid order amount.", retryable=True)
+    if not isinstance(currency, str) or not CURRENCY_RE.fullmatch(currency):
+        raise WorkerError("malformed_response", "Shopify returned an invalid currency.", retryable=True)
+
+    statuses: dict[str, str | None] = {}
+    for source, target in (
+        ("displayFinancialStatus", "financialStatus"),
+        ("displayFulfillmentStatus", "fulfillmentStatus"),
+    ):
+        item = value.get(source)
+        if item is not None and (not isinstance(item, str) or not ENUM_RE.fullmatch(item)):
+            raise WorkerError("malformed_response", "Shopify returned an invalid order status.", retryable=True)
+        statuses[target] = item
+
+    gid_hash = hashlib.sha256(gid.encode("utf-8")).hexdigest()
+    public = {
+        "idHash": gid_hash,
+        "name": name,
+        "createdAt": created_at,
+        "amount": amount,
+        "currency": currency,
+        "financialStatus": statuses["financialStatus"],
+        "fulfillmentStatus": statuses["fulfillmentStatus"],
+        "test": value["test"],
+        "url": order_url(store, legacy_id),
+        "unread": False,
+    }
+    return FetchedOrder(gid, gid_hash, legacy_id, created_at, created_dt, public)
+
+
+def parse_page(
+    payload: bytes,
+    store: str,
+    since: dt.datetime,
+    until: dt.datetime,
+) -> tuple[list[FetchedOrder], list[str], bool, str | None, str]:
+    try:
+        parsed = json.loads(payload.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise WorkerError("malformed_response", "Shopify returned malformed JSON.", retryable=True) from exc
+    _check_search_warnings(parsed)
+    root = _graphql_root(parsed)
+    shop = root.get("shop")
+    if not isinstance(shop, dict) or set(shop) != {"name"}:
+        raise WorkerError("malformed_response", "Shopify returned invalid shop data.", retryable=True)
+    display_name = _validate_display_name(shop.get("name"))
+    orders = root.get("orders")
+    if not isinstance(orders, dict):
+        raise WorkerError("malformed_response", "Shopify returned no order connection.", retryable=True)
+    edges = orders.get("edges")
+    page_info = orders.get("pageInfo")
+    if not isinstance(edges, list) or len(edges) > PAGE_SIZE or not isinstance(page_info, dict):
+        raise WorkerError("malformed_response", "Shopify returned an invalid order page.", retryable=True)
+    result: list[FetchedOrder] = []
+    edge_cursors: list[str] = []
+    page_cursors: set[str] = set()
+    for edge in edges:
+        if (
+            not isinstance(edge, dict)
+            or not isinstance(edge.get("cursor"), str)
+            or not CURSOR_RE.fullmatch(edge["cursor"])
+        ):
+            raise WorkerError("malformed_response", "Shopify returned an invalid order cursor.", retryable=True)
+        cursor = edge["cursor"]
+        if cursor in page_cursors:
+            raise WorkerError("malformed_response", "Shopify returned duplicate order cursors.", retryable=True)
+        page_cursors.add(cursor)
+        edge_cursors.append(cursor)
+        order = parse_order_node(edge.get("node"), store)
+        if order.created_dt < since or order.created_dt > until:
+            raise WorkerError(
+                "search_filter_violation",
+                "Shopify returned an order outside OrderBell's bounded polling window.",
+                retryable=False,
+            )
+        result.append(order)
+    has_next = page_info.get("hasNextPage")
+    end_cursor = page_info.get("endCursor")
+    if not isinstance(has_next, bool):
+        raise WorkerError("malformed_response", "Shopify returned invalid pagination metadata.", retryable=True)
+    if not edges:
+        if has_next or end_cursor is not None:
+            raise WorkerError(
+                "malformed_response",
+                "Shopify returned inconsistent pagination metadata.",
+                retryable=True,
+            )
+    elif (
+        not isinstance(end_cursor, str)
+        or not CURSOR_RE.fullmatch(end_cursor)
+        or end_cursor != edge_cursors[-1]
+    ):
+        raise WorkerError("malformed_response", "Shopify returned invalid pagination metadata.", retryable=True)
+    return result, edge_cursors, has_next, end_cursor, display_name
+
+
+def query_file_path() -> Path:
+    path = Path(__file__).resolve().parent.parent / "graphql" / "orders.graphql"
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise WorkerError("dependency_missing", "OrderBell's read-only GraphQL query is missing.") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise WorkerError("dependency_missing", "OrderBell's read-only GraphQL query is invalid.")
+    return path
+
+
+def fetch_orders(
+    store: str,
+    since: dt.datetime,
+    until: dt.datetime,
+    deadline: float,
+) -> tuple[list[FetchedOrder], str]:
+    all_orders: dict[str, FetchedOrder] = {}
+    after: str | None = None
+    prior_cursors: set[str] = set()
+    display_name: str | None = None
+    total_edges = 0
+    query = f"created_at:>='{iso_utc(since)}' AND created_at:<='{iso_utc(until)}'"
+    for _page_number in range(MAX_PAGES):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise WorkerError("timeout", "The complete Shopify poll timed out.", retryable=True)
+        variables = json.dumps(
+            {"first": PAGE_SIZE, "after": after, "query": query},
+            separators=(",", ":"),
+        )
+        argv = [
+            "shopify",
+            "store",
+            "execute",
+            "--store",
+            store,
+            "--version",
+            API_VERSION,
+            "--json",
+            "--query-file",
+            os.fspath(query_file_path()),
+            "--variables",
+            variables,
+        ]
+        result = run_bounded(argv, timeout=remaining)
+        if result.returncode != 0:
+            raise classify_cli_failure(result)
+        page, edge_cursors, has_next, end_cursor, page_display_name = parse_page(
+            result.stdout,
+            store,
+            since,
+            until,
+        )
+        if display_name is None:
+            display_name = page_display_name
+        elif page_display_name != display_name:
+            raise WorkerError(
+                "malformed_response",
+                "Shopify returned inconsistent shop data across order pages.",
+                retryable=True,
+            )
+        for cursor in edge_cursors:
+            if cursor in prior_cursors:
+                raise WorkerError("malformed_response", "Shopify pagination reused an order cursor.", retryable=True)
+            prior_cursors.add(cursor)
+        total_edges += len(edge_cursors)
+        if total_edges > MAX_ORDERS_PER_POLL:
+            raise WorkerError(
+                "catchup_too_large",
+                "The polling window exceeds OrderBell's safe pagination limit.",
+                retryable=False,
+            )
+        for order in page:
+            prior = all_orders.get(order.gid)
+            if prior is not None:
+                message = (
+                    "Shopify returned conflicting duplicate orders."
+                    if prior.public != order.public
+                    else "Shopify returned a duplicate order in its pagination stream."
+                )
+                raise WorkerError("malformed_response", message, retryable=True)
+            all_orders[order.gid] = order
+        if not has_next:
+            break
+        assert end_cursor is not None
+        if end_cursor == after:
+            raise WorkerError("malformed_response", "Shopify pagination stopped making progress.", retryable=True)
+        after = end_cursor
+    else:
+        raise WorkerError(
+            "catchup_too_large",
+            "The polling window exceeds OrderBell's safe pagination limit.",
+            retryable=False,
+        )
+    assert display_name is not None
+    return sorted(all_orders.values(), key=lambda order: (order.created_dt, order.gid)), display_name
+
+
+def _poll_window(state: dict[str, Any], started: dt.datetime) -> PollWindow:
+    if not state["initialized"]:
+        return PollWindow(started - OVERLAP, started, False)
+
+    watermark, _ = parse_timestamp(state["watermarkCreatedAt"], field="watermark")
+    if watermark <= started:
+        lag = started - watermark
+        if lag > MAX_CATCHUP_HORIZON:
+            raise WorkerError(
+                "catchup_window_exceeded",
+                "OrderBell is too far behind for a lossless automatic catch-up.",
+                retryable=False,
+            )
+        until = min(started, watermark + MAX_CATCHUP_SPAN)
+        return PollWindow(watermark - OVERLAP, until, until < started)
+
+    # A saved checkpoint in the local future means the wall clock moved
+    # backwards after an earlier poll.  Rewind conservatively by the same skew
+    # and rebuild coverage in bounded chunks.  This favors duplicate alerts
+    # over silently skipping orders.
+    skew = watermark - started
+    if skew > MAX_CATCHUP_HORIZON:
+        raise WorkerError(
+            "clock_recovery_exceeded",
+            "The local clock changed too far for a lossless automatic recovery.",
+            retryable=False,
+        )
+    recovery_start = started - skew
+    until = min(started, recovery_start + MAX_CATCHUP_SPAN)
+    return PollWindow(recovery_start - OVERLAP, until, True)
+
+
+def _status_words(value: str | None) -> str:
+    if value is None:
+        return ""
+    return value.replace("_", " ").title()
+
+
+def _display_label(store: str, display_name: str | None) -> str:
+    store = validate_store(store)
+    return store if display_name is None else _validate_display_name(display_name, state=True)
+
+
+def notification_argv(
+    order: dict[str, Any],
+    store: str,
+    display_name: str | None,
+    *,
+    privacy: bool,
+) -> list[str]:
+    store = validate_store(store)
+    label = _display_label(store, display_name)
+    url = order["url"]
+    if privacy:
+        headline = "New Shopify order"
+        financial = _status_words(order.get("financialStatus")) or "Unavailable"
+        fulfillment = _status_words(order.get("fulfillmentStatus")) or "Unavailable"
+        body = notification_body_text(
+            f"{label} · Payment: {financial} · Fulfillment: {fulfillment}",
+            160,
+        )
+    else:
+        headline = sanitize_text(f"New Shopify order {order['name']}", 96)
+        details = [label, f"{order['amount']} {order['currency']}"]
+        financial = _status_words(order.get("financialStatus"))
+        fulfillment = _status_words(order.get("fulfillmentStatus"))
+        if financial:
+            details.append(financial)
+        if fulfillment:
+            details.append(fulfillment)
+        body = notification_body_text(" · ".join(details), 160)
+    return [
+        "omarchy",
+        "notification",
+        "send",
+        "--app-name",
+        "OrderBell",
+        "-g",
+        "󰄬",
+        "-u",
+        "normal",
+        "-t",
+        str(NOTIFICATION_EXPIRE_MS),
+        headline,
+        body,
+        "--exec",
+        "xdg-open",
+        url,
+    ]
+
+
+def burst_notification_argv(
+    entry: dict[str, Any],
+    store: str,
+    display_name: str | None,
+) -> list[str]:
+    store = validate_store(store)
+    label = _display_label(store, display_name)
+    count = entry["count"]
+    headline = f"{count} new Shopify {'order' if count == 1 else 'orders'}"
+    # Omarchy recognizes known flags in the optional description position.
+    # Prefix the remote shop label so a legitimate or hostile name such as
+    # "--exec" can only ever remain notification text.
+    body = notification_body_text(f"Store: {label}", 160)
+    return [
+        "omarchy",
+        "notification",
+        "send",
+        "--app-name",
+        "OrderBell",
+        "-g",
+        "󰄬",
+        "-u",
+        "normal",
+        "-t",
+        str(NOTIFICATION_EXPIRE_MS),
+        headline,
+        body,
+        "--exec",
+        "xdg-open",
+        order_url(store),
+    ]
+
+
+def send_notification(
+    entry: dict[str, Any],
+    store: str,
+    display_name: str | None,
+    *,
+    privacy: bool,
+    timeout: float,
+) -> None:
+    argv = (
+        notification_argv(entry["order"], store, display_name, privacy=privacy)
+        if entry["kind"] == "order"
+        else burst_notification_argv(entry, store, display_name)
+    )
+    result = run_bounded(
+        argv,
+        timeout=min(timeout, 15),
+        max_stdout=16 * 1024,
+        max_stderr=16 * 1024,
+    )
+    if result.returncode != 0:
+        raise WorkerError(
+            "notification_failed",
+            "Omarchy could not deliver an OrderBell notification.",
+            retryable=True,
+        )
+
+
+def _merge_recent(
+    existing: list[dict[str, Any]],
+    fetched: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = {order["idHash"]: dict(order) for order in existing}
+    for order in fetched:
+        previous = merged.get(order["idHash"])
+        replacement = dict(order)
+        if previous is not None:
+            replacement["unread"] = previous["unread"]
+        merged[order["idHash"]] = replacement
+    return sorted(merged.values(), key=lambda order: (order["createdAt"], order["idHash"]), reverse=True)[
+        :MAX_RECENT_ORDERS
+    ]
+
+
+def _prune_seen(seen: dict[str, str], watermark: dt.datetime) -> dict[str, str]:
+    cutoff = watermark - OVERLAP - SEEN_SAFETY_MARGIN
+    result: dict[str, str] = {}
+    for item_hash, timestamp in seen.items():
+        parsed, normalized = parse_timestamp(timestamp, field="deduplication timestamp")
+        if parsed >= cutoff:
+            result[item_hash] = normalized
+    if len(result) > MAX_SEEN:
+        raise WorkerError(
+            "dedupe_window_full",
+            "The deduplication window contains too many orders to checkpoint safely.",
+            retryable=False,
+        )
+    return result
+
+
+def _compact_outbox(store: str, outbox: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    totals: dict[bool, int] = {False: 0, True: 0}
+    attempts: dict[bool, int] = {False: 0, True: 0}
+    for entry in outbox:
+        if entry["kind"] == "order":
+            test = bool(entry["order"]["test"])
+            count = 1
+        else:
+            test = bool(entry["test"])
+            count = int(entry["count"])
+        if totals[test] > 2_147_483_647 - count:
+            raise WorkerError("outbox_full", "The notification backlog reached its safe limit.")
+        totals[test] += count
+        attempts[test] = max(attempts[test], int(entry["attempts"]))
+    compacted: list[dict[str, Any]] = []
+    for test in (False, True):
+        if totals[test]:
+            compacted.append(
+                {
+                    "kind": "burst",
+                    "eventId": _burst_event_id(store, test),
+                    "count": totals[test],
+                    "test": test,
+                    "url": order_url(store),
+                    "attempts": attempts[test],
+                }
+            )
+    return compacted
+
+
+def _add_burst(
+    store: str,
+    outbox: list[dict[str, Any]],
+    *,
+    test: bool,
+    count: int,
+) -> None:
+    for entry in outbox:
+        if entry["kind"] == "burst" and entry["test"] is test:
+            if entry["count"] > 2_147_483_647 - count:
+                raise WorkerError("outbox_full", "The notification backlog reached its safe limit.")
+            entry["count"] += count
+            return
+    outbox.append(
+        {
+            "kind": "burst",
+            "eventId": _burst_event_id(store, test),
+            "count": count,
+            "test": test,
+            "url": order_url(store),
+            "attempts": 0,
+        }
+    )
+
+
+def _enqueue_notifications(
+    store: str,
+    outbox: list[dict[str, Any]],
+    orders: list[FetchedOrder],
+) -> list[dict[str, Any]]:
+    if not orders:
+        return outbox
+    result = [dict(entry) for entry in outbox]
+    if len(orders) > MAX_INDIVIDUAL_NOTIFICATIONS_PER_POLL:
+        result = _compact_outbox(store, result)
+        for test in (False, True):
+            count = sum(1 for order in orders if order.public["test"] is test)
+            if count:
+                _add_burst(store, result, test=test, count=count)
+        return result
+
+    if len(result) + len(orders) > MAX_OUTBOX:
+        result = _compact_outbox(store, result)
+    existing_ids = {entry["eventId"] for entry in result}
+    for order in orders:
+        if order.gid_hash in existing_ids:
+            continue
+        result.append(
+            {
+                "kind": "order",
+                "eventId": order.gid_hash,
+                "order": dict(order.public, unread=True),
+                "attempts": 0,
+            }
+        )
+        existing_ids.add(order.gid_hash)
+    if len(result) > MAX_OUTBOX:
+        raise WorkerError("outbox_full", "The notification backlog reached its safe limit.")
+    return result
+
+
+def _backoff(failure_count: int, interval: int, code: str) -> int:
+    base = interval
+    if code in {"authentication_required", "dependency_missing", "search_warning"}:
+        base = max(base, 300)
+    elif code == "throttled":
+        base = max(base, 60)
+    exponent = min(max(failure_count - 1, 0), 6)
+    delay = min(3600, base * (2**exponent))
+    jitter = random.SystemRandom().randint(0, max(1, delay // 5))
+    return min(3600, delay + jitter)
+
+
+def _record_failure(store: str, state: dict[str, Any], error: WorkerError) -> dict[str, Any]:
+    state = dict(state)
+    state["failureCount"] = min(30, int(state.get("failureCount", 0)) + 1)
+    try:
+        write_state(store, state)
+    except WorkerError:
+        # Preserve the original, more actionable polling error.  Atomic state
+        # writes mean an unsuccessful retry update cannot corrupt prior state.
+        pass
+    return state
+
+
+def _flush_outbox(
+    store: str,
+    state: dict[str, Any],
+    *,
+    privacy: bool,
+    deadline: float,
+    attempts_remaining: int,
+) -> tuple[WorkerError | None, int]:
+    while state["outbox"]:
+        if attempts_remaining <= 0:
+            return (
+                WorkerError(
+                    "notification_backlog",
+                    "OrderBell deferred part of the notification backlog to the next poll.",
+                    retryable=True,
+                ),
+                attempts_remaining,
+            )
+        entry = state["outbox"][0]
+        if entry["attempts"] >= MAX_NOTIFICATION_ATTEMPTS_PER_ENTRY:
+            return (
+                WorkerError(
+                    "notification_retry_limit",
+                    "Notification delivery reached its retry limit; disable notifications to clear the backlog.",
+                    retryable=False,
+                ),
+                attempts_remaining,
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return (
+                WorkerError(
+                    "notification_budget_exhausted",
+                    "OrderBell deferred notifications after reaching this poll's time limit.",
+                    retryable=True,
+                ),
+                attempts_remaining,
+            )
+        attempts_remaining -= 1
+        try:
+            send_notification(
+                entry,
+                store,
+                state["displayName"],
+                privacy=privacy,
+                timeout=remaining,
+            )
+        except WorkerError as error:
+            entry["attempts"] = min(
+                MAX_NOTIFICATION_ATTEMPTS_PER_ENTRY,
+                entry["attempts"] + 1,
+            )
+            write_state(store, state)
+            return error, attempts_remaining
+        # A crash between the send and this durable ack intentionally causes a
+        # duplicate on restart instead of silently losing the order.
+        state["outbox"] = state["outbox"][1:]
+        write_state(store, state)
+    return None, attempts_remaining
+
+
+def _outbox_entry_is_test(entry: dict[str, Any]) -> bool:
+    if entry["kind"] == "burst":
+        return bool(entry["test"])
+    return bool(entry["order"]["test"])
+
+
+def _discard_disabled_state(options: Options, state: dict[str, Any]) -> bool:
+    changed = False
+    original = state["outbox"]
+    if not options.notify:
+        retained: list[dict[str, Any]] = []
+    elif not options.include_test_orders:
+        retained = [entry for entry in original if not _outbox_entry_is_test(entry)]
+    else:
+        retained = original
+    if len(retained) != len(original):
+        state["outbox"] = retained
+        changed = True
+
+    if not options.include_test_orders:
+        recent = [order for order in state["recentOrders"] if not order["test"]]
+        if len(recent) != len(state["recentOrders"]):
+            state["recentOrders"] = recent
+            changed = True
+        unread_tests = state["unreadTestCount"]
+        if unread_tests:
+            state["unreadCount"] = max(0, state["unreadCount"] - unread_tests)
+            state["unreadTestCount"] = 0
+            changed = True
+    return changed
+
+
+def poll(options: Options) -> tuple[dict[str, Any], int]:
+    deadline = time.monotonic() + options.timeout
+    with StoreLock(options.store):
+        state = read_state(options.store)
+        if _discard_disabled_state(options, state):
+            # Configuration changes are durable even when the subsequent
+            # network poll fails, so stale alerts can never replay later.
+            write_state(options.store, state)
+
+        notification_attempts = MAX_NOTIFICATION_ATTEMPTS_PER_RUN
+        if options.notify and state["outbox"]:
+            notify_error, notification_attempts = _flush_outbox(
+                options.store,
+                state,
+                privacy=options.privacy,
+                deadline=deadline,
+                attempts_remaining=notification_attempts,
+            )
+            if notify_error is not None:
+                # Durable work gets a bounded chance before any Shopify
+                # dependency.  A blocked FIFO remains visible and prevents a
+                # fetch from consuming the rest of this run's budget.
+                return output_document(
+                    state,
+                    status="degraded",
+                    error=notify_error,
+                    next_poll=60,
+                ), 0
+
+        started = utc_now()
+        try:
+            window = _poll_window(state, started)
+            fetched, display_name = fetch_orders(
+                options.store,
+                window.since,
+                window.until,
+                deadline,
+            )
+        except WorkerError as error:
+            state = _record_failure(options.store, state, error)
+            return output_document(
+                state,
+                status="error",
+                error=error,
+                next_poll=_backoff(state["failureCount"], options.interval, error.code),
+            ), 1
+
+        baseline = not state["initialized"]
+        existing_seen = set(state["seen"])
+        eligible = [order for order in fetched if options.include_test_orders or not order.public["test"]]
+        new_orders = [] if baseline else [order for order in eligible if order.gid_hash not in existing_seen]
+
+        new_hashes = {order.gid_hash for order in new_orders}
+        public_orders: list[dict[str, Any]] = []
+        for order in eligible:
+            public = dict(order.public)
+            if baseline:
+                public["unread"] = False
+            elif order.gid_hash in new_hashes:
+                public["unread"] = True
+            public_orders.append(public)
+
+        seen = dict(state["seen"])
+        for order in fetched:
+            seen[order.gid_hash] = order.created_at
+        try:
+            next_state = dict(state)
+            next_state["displayName"] = display_name
+            next_state["seen"] = _prune_seen(seen, window.until)
+            next_state["watermarkCreatedAt"] = iso_utc(window.until)
+            next_state["initialized"] = True
+            next_state["recentOrders"] = _merge_recent(state["recentOrders"], public_orders)
+            next_state["unreadCount"] = min(
+                2_147_483_647,
+                state["unreadCount"] + len(new_orders),
+            )
+            next_state["unreadTestCount"] = min(
+                next_state["unreadCount"],
+                state["unreadTestCount"]
+                + sum(1 for order in new_orders if order.public["test"]),
+            )
+            if options.notify:
+                next_state["outbox"] = _enqueue_notifications(
+                    options.store,
+                    state["outbox"],
+                    new_orders,
+                )
+            next_state["lastSuccessfulPollAt"] = iso_utc(utc_now())
+            next_state["failureCount"] = 0
+        except WorkerError as error:
+            state = _record_failure(options.store, state, error)
+            return output_document(
+                state,
+                status="error",
+                error=error,
+                next_poll=_backoff(state["failureCount"], options.interval, error.code),
+            ), 1
+        # Do not turn an ambiguous fsync/rename failure into a rollback write:
+        # the atomic replacement may already be visible and is always safer
+        # than overwriting it with the prior checkpoint.
+        write_state(options.store, next_state)
+        state = next_state
+
+        notify_error: WorkerError | None = None
+        if options.notify and state["outbox"]:
+            notify_error, notification_attempts = _flush_outbox(
+                options.store,
+                state,
+                privacy=options.privacy,
+                deadline=deadline,
+                attempts_remaining=notification_attempts,
+            )
+
+        status = "baseline" if baseline else ("catching_up" if window.catching_up else "ok")
+        if notify_error is not None:
+            status = "degraded"
+        return output_document(
+            state,
+            status=status,
+            error=notify_error,
+            next_poll=(
+                60
+                if notify_error
+                else (60 if window.catching_up else options.interval)
+            ),
+        ), 0
+
+
+def status_command(options: Options) -> tuple[dict[str, Any], int]:
+    state = read_state(options.store)
+    return output_document(state, status="ok", error=None, next_poll=options.interval), 0
+
+
+def mark_read(options: Options) -> tuple[dict[str, Any], int]:
+    with StoreLock(options.store):
+        state = read_state(options.store)
+        state["unreadCount"] = 0
+        state["unreadTestCount"] = 0
+        state["recentOrders"] = [dict(order, unread=False) for order in state["recentOrders"]]
+        write_state(options.store, state)
+        return output_document(state, status="ok", error=None, next_poll=options.interval), 0
+
+
+def authenticate(options: Options) -> tuple[dict[str, Any], int]:
+    with StoreLock(options.store):
+        result = run_bounded(
+            [
+                "shopify",
+                "store",
+                "auth",
+                "--store",
+                options.store,
+                "--scopes",
+                "read_orders",
+                "--json",
+                "--no-color",
+            ],
+            timeout=options.timeout,
+            max_stdout=256 * 1024,
+            max_stderr=64 * 1024,
+        )
+        state = read_state(options.store)
+        if result.returncode != 0:
+            error = classify_cli_failure(result)
+            return output_document(state, status="error", error=error, next_poll=300), 1
+        try:
+            verify_auth_result(result.stdout, options.store)
+        except WorkerError as error:
+            return output_document(state, status="error", error=error, next_poll=300), 1
+        return output_document(state, status="ok", error=None, next_poll=options.interval), 0
+
+
+def test_notification(options: Options) -> tuple[dict[str, Any], int]:
+    state = read_state(options.store)
+    url = order_url(options.store)
+    label = _display_label(options.store, state["displayName"])
+    body = notification_body_text(
+        f"{label} · Order details are hidden."
+        if options.privacy
+        else f"Connected to {label}."
+    )
+    result = run_bounded(
+        [
+            "omarchy",
+            "notification",
+            "send",
+            "--app-name",
+            "OrderBell",
+            "-g",
+            "󰄬",
+            "-u",
+            "normal",
+            "-t",
+            str(NOTIFICATION_EXPIRE_MS),
+            "OrderBell is ready",
+            body,
+            "--exec",
+            "xdg-open",
+            url,
+        ],
+        timeout=min(options.timeout, 15),
+        max_stdout=16 * 1024,
+        max_stderr=16 * 1024,
+    )
+    if result.returncode != 0:
+        error = WorkerError("notification_failed", "Omarchy could not deliver the test notification.", retryable=True)
+        return output_document(state, status="error", error=error, next_poll=options.interval), 1
+    return output_document(state, status="ok", error=None, next_poll=options.interval), 0
+
+
+def output_document(
+    state: dict[str, Any],
+    *,
+    status: str,
+    error: WorkerError | None,
+    next_poll: int,
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "stateAuthoritative": True,
+        "status": status,
+        "store": state["store"],
+        "displayName": state["displayName"],
+        "recentOrders": state["recentOrders"][:MAX_RECENT_ORDERS],
+        "unreadCount": state["unreadCount"],
+        "pendingCount": len(state["outbox"]),
+        "error": None
+        if error is None
+        else {
+            "code": sanitize_text(error.code, 48),
+            "message": error.safe_message,
+            "retryable": bool(error.retryable),
+        },
+        "nextPollSeconds": max(60, min(3600, int(next_poll))),
+        "lastSuccessfulPollAt": state["lastSuccessfulPollAt"],
+    }
+
+
+def error_document(store: str | None, error: WorkerError, *, next_poll: int = 300) -> dict[str, Any]:
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "stateAuthoritative": False,
+        "status": "busy" if error.code == "busy" else "error",
+        "store": store,
+        "displayName": None,
+        "recentOrders": [],
+        "unreadCount": 0,
+        "pendingCount": 0,
+        "error": {
+            "code": sanitize_text(error.code, 48),
+            "message": error.safe_message,
+            "retryable": bool(error.retryable),
+        },
+        "nextPollSeconds": max(60, min(3600, next_poll)),
+        "lastSuccessfulPollAt": None,
+    }
+
+
+def emit(document: dict[str, Any]) -> None:
+    try:
+        # Quickshell forwards stdout in arbitrary QString chunks. Keeping the
+        # wire representation ASCII prevents a multibyte UTF-8 code point from
+        # being split and replaced before QML joins and parses the chunks;
+        # JSON.parse restores the original Unicode text from escapes.
+        rendered = json.dumps(document, ensure_ascii=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        rendered = json.dumps(
+            error_document(None, WorkerError("internal", "OrderBell could not encode its result.")),
+            separators=(",", ":"),
+        )
+    if len(rendered.encode("utf-8")) > MAX_JSON_OUTPUT:
+        rendered = json.dumps(
+            error_document(
+                document.get("store"),
+                WorkerError(
+                    "output_too_large",
+                    "OrderBell's result exceeded its safe limit.",
+                ),
+            ),
+            separators=(",", ":"),
+        )
+    sys.stdout.write(rendered + "\n")
+    sys.stdout.flush()
+
+
+def dispatch(options: Options) -> tuple[dict[str, Any], int]:
+    if options.command == "poll":
+        return poll(options)
+    if options.command == "status":
+        return status_command(options)
+    if options.command == "mark-read":
+        return mark_read(options)
+    if options.command == "authenticate":
+        return authenticate(options)
+    if options.command == "test-notification":
+        return test_notification(options)
+    raise UsageError(_usage())
+
+
+def _raise_interrupt(_signum: int, _frame: Any) -> NoReturn:
+    raise KeyboardInterrupt
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    os.umask(0o077)
+    try:
+        signal.signal(signal.SIGTERM, _raise_interrupt)
+    except ValueError:
+        # main() can be called by a unit test outside the interpreter's main
+        # thread; subprocess execution always installs the handler.
+        pass
+    raw = list(sys.argv[1:] if argv is None else argv)
+    store: str | None = None
+    try:
+        options = parse_cli(raw)
+        store = options.store
+        document, code = dispatch(options)
+    except KeyboardInterrupt:
+        error = WorkerError("interrupted", "OrderBell was interrupted.", retryable=True)
+        document, code = error_document(store, error), 130
+    except BusyError as error:
+        document, code = error_document(store, error, next_poll=5), 0
+    except WorkerError as error:
+        document, code = error_document(store, error), 2 if error.code in {"usage", "invalid_store"} else 1
+    except Exception:
+        # Never expose exception text: it can contain filesystem paths, CLI
+        # output, or secrets supplied by a compromised dependency.
+        error = WorkerError(
+            "internal",
+            "OrderBell failed safely because of an unexpected local error.",
+            retryable=True,
+        )
+        document, code = error_document(store, error), 1
+    emit(document)
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
