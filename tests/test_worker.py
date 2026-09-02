@@ -1279,6 +1279,367 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertNotEqual(process.returncode, 0)
         self.assertEqual(result["error"]["code"], "unsafe_state")
 
+    def test_state_write_transaction_is_descriptor_relative(self) -> None:
+        self.baseline()
+        worker = runpy.run_path(str(WORKER), run_name="orderbell_worker_dirfd_test")
+        state = self.state_json()
+        state["failureCount"] = 1
+        real_open = worker["os"].open
+        real_replace = worker["os"].replace
+        real_fsync = worker["os"].fsync
+        directory_opens: list[tuple[int, int, int | None, int]] = []
+        temporary_opens: list[tuple[str, int, int, int | None, int]] = []
+        replacements: list[tuple[str, str, int | None, int | None]] = []
+        fsynced: list[int] = []
+        closed: list[int] = []
+        real_close = worker["os"].close
+
+        def traced_open(
+            path: Any,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            opened = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path) == self.state_path().parent:
+                directory_opens.append((flags, mode, dir_fd, opened))
+            elif isinstance(path, str) and path.startswith(".orderbell-"):
+                temporary_opens.append((path, flags, mode, dir_fd, opened))
+            return opened
+
+        def traced_replace(
+            source: str,
+            target: str,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
+            replacements.append((source, target, src_dir_fd, dst_dir_fd))
+            real_replace(
+                source,
+                target,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        def traced_fsync(fd: int) -> None:
+            fsynced.append(fd)
+            real_fsync(fd)
+
+        def traced_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        with (
+            mock.patch.dict(worker["os"].environ, self.env, clear=True),
+            mock.patch.object(worker["os"], "open", side_effect=traced_open),
+            mock.patch.object(worker["os"], "replace", side_effect=traced_replace),
+            mock.patch.object(worker["os"], "fsync", side_effect=traced_fsync),
+            mock.patch.object(worker["os"], "close", side_effect=traced_close),
+        ):
+            worker["write_state"](STORE, state)
+
+        self.assertEqual(len(directory_opens), 1)
+        directory_flags, _, parent_directory_fd, held_directory_fd = directory_opens[0]
+        self.assertIsNone(parent_directory_fd)
+        self.assertEqual(directory_flags & os.O_ACCMODE, os.O_RDONLY)
+        for required in (os.O_DIRECTORY, os.O_NOFOLLOW, os.O_CLOEXEC):
+            self.assertEqual(directory_flags & required, required)
+        self.assertEqual(len(temporary_opens), 1)
+        temporary, flags, mode, directory_fd, state_fd = temporary_opens[0]
+        self.assertNotIn(os.sep, temporary)
+        self.assertEqual(mode, 0o600)
+        self.assertEqual(directory_fd, held_directory_fd)
+        for required in (os.O_CREAT, os.O_EXCL, os.O_NOFOLLOW, os.O_CLOEXEC):
+            self.assertEqual(flags & required, required)
+        self.assertEqual(
+            replacements,
+            [(temporary, self.state_path().name, directory_fd, directory_fd)],
+        )
+        self.assertIn(directory_fd, fsynced)
+        self.assertIn(state_fd, closed)
+        self.assertIn(held_directory_fd, closed)
+        self.assertEqual(self.state_json()["failureCount"], 1)
+        self.assertEqual(list(self.state_path().parent.glob(".orderbell-*.tmp")), [])
+
+    def test_state_write_directory_swap_never_reaches_attacker_target(self) -> None:
+        self.baseline()
+        worker = runpy.run_path(str(WORKER), run_name="orderbell_worker_swap_test")
+        state = self.state_json()
+        state["failureCount"] = 1
+        stores = self.state_path().parent
+        target_name = self.state_path().name
+        backup = self.base / "stores-held-by-worker"
+        attacker = self.base / "attacker-directory"
+        attacker.mkdir(mode=0o700)
+        real_replace = worker["os"].replace
+        swapped = False
+
+        def swap_then_replace(
+            source: str,
+            target: str,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
+            nonlocal swapped
+            self.assertFalse(swapped)
+            stores.rename(backup)
+            stores.symlink_to(attacker, target_is_directory=True)
+            swapped = True
+            real_replace(
+                source,
+                target,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        with (
+            mock.patch.dict(worker["os"].environ, self.env, clear=True),
+            mock.patch.object(worker["os"], "replace", side_effect=swap_then_replace),
+            self.assertRaises(worker["WorkerError"]) as caught,
+        ):
+            worker["write_state"](STORE, state)
+
+        self.assertTrue(swapped)
+        self.assertEqual(caught.exception.code, "unsafe_state")
+        self.assertEqual(list(attacker.iterdir()), [])
+        saved = json.loads((backup / target_name).read_text(encoding="utf-8"))
+        self.assertEqual(saved["failureCount"], 1)
+        self.assertEqual(list(backup.glob(".orderbell-*.tmp")), [])
+
+    def test_state_target_swap_between_validation_and_replace_is_not_followed(self) -> None:
+        self.baseline()
+        worker = runpy.run_path(str(WORKER), run_name="orderbell_worker_target_swap_test")
+        state = self.state_json()
+        state["failureCount"] = 1
+        valuable = self.base / "valuable-target-after-validation"
+        valuable.write_text("DO NOT TOUCH", encoding="utf-8")
+        real_verify = worker["_verify_state_directory_binding"]
+        verification_count = 0
+
+        def verify_then_swap_target(directory_fd: int, directory: Path) -> None:
+            nonlocal verification_count
+            real_verify(directory_fd, directory)
+            verification_count += 1
+            if verification_count == 2:
+                target = self.state_path().name
+                os.unlink(target, dir_fd=directory_fd)
+                os.symlink(valuable, target, dir_fd=directory_fd)
+
+        globals_ = worker["write_state"].__globals__
+        with (
+            mock.patch.dict(worker["os"].environ, self.env, clear=True),
+            mock.patch.dict(
+                globals_,
+                {"_verify_state_directory_binding": verify_then_swap_target},
+            ),
+        ):
+            worker["write_state"](STORE, state)
+
+        self.assertEqual(verification_count, 3)
+        self.assertEqual(valuable.read_text(encoding="utf-8"), "DO NOT TOUCH")
+        self.assertTrue(self.state_path().is_file())
+        self.assertFalse(self.state_path().is_symlink())
+        self.assertEqual(self.state_json()["failureCount"], 1)
+
+    def test_changed_temporary_entry_is_refused_before_replace_and_cleaned(self) -> None:
+        self.baseline()
+        worker = runpy.run_path(str(WORKER), run_name="orderbell_worker_temp_swap_test")
+        state = self.state_json()
+        state["failureCount"] = 1
+        original = self.state_path().read_bytes()
+        real_open = worker["os"].open
+        real_verify = worker["_verify_state_directory_binding"]
+        temporary: str | None = None
+        temporary_directory_fd: int | None = None
+        verification_count = 0
+
+        def traced_open(
+            path: Any,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal temporary, temporary_directory_fd
+            opened = real_open(path, flags, mode, dir_fd=dir_fd)
+            if isinstance(path, str) and path.startswith(".orderbell-"):
+                temporary = path
+                temporary_directory_fd = dir_fd
+            return opened
+
+        def verify_then_change_temporary(directory_fd: int, directory: Path) -> None:
+            nonlocal verification_count
+            real_verify(directory_fd, directory)
+            verification_count += 1
+            if verification_count == 2:
+                self.assertIsNotNone(temporary)
+                self.assertEqual(directory_fd, temporary_directory_fd)
+                os.unlink(temporary, dir_fd=directory_fd)
+                attacker_fd = real_open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    os.write(attacker_fd, b"attacker-controlled temporary")
+                finally:
+                    os.close(attacker_fd)
+
+        globals_ = worker["write_state"].__globals__
+        with (
+            mock.patch.dict(worker["os"].environ, self.env, clear=True),
+            mock.patch.object(worker["os"], "open", side_effect=traced_open),
+            mock.patch.dict(
+                globals_,
+                {"_verify_state_directory_binding": verify_then_change_temporary},
+            ),
+            self.assertRaises(worker["WorkerError"]) as caught,
+        ):
+            worker["write_state"](STORE, state)
+
+        self.assertEqual(caught.exception.code, "unsafe_state")
+        self.assertEqual(self.state_path().read_bytes(), original)
+        self.assertEqual(list(self.state_path().parent.glob(".orderbell-*.tmp")), [])
+
+    def test_state_write_verifies_the_installed_inode(self) -> None:
+        self.baseline()
+        worker = runpy.run_path(str(WORKER), run_name="orderbell_worker_inode_test")
+        state = self.state_json()
+        state["failureCount"] = 1
+        valuable = self.base / "valuable-state-target"
+        valuable.write_text("DO NOT TOUCH", encoding="utf-8")
+        real_replace = worker["os"].replace
+
+        def replace_then_swap_target(
+            source: str,
+            target: str,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
+            real_replace(
+                source,
+                target,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+            self.assertIsNotNone(dst_dir_fd)
+            os.unlink(target, dir_fd=dst_dir_fd)
+            os.symlink(valuable, target, dir_fd=dst_dir_fd)
+
+        with (
+            mock.patch.dict(worker["os"].environ, self.env, clear=True),
+            mock.patch.object(
+                worker["os"],
+                "replace",
+                side_effect=replace_then_swap_target,
+            ),
+            self.assertRaises(worker["WorkerError"]) as caught,
+        ):
+            worker["write_state"](STORE, state)
+
+        self.assertEqual(caught.exception.code, "unsafe_state")
+        self.assertEqual(valuable.read_text(encoding="utf-8"), "DO NOT TOUCH")
+
+    def test_failed_state_write_cleans_temporary_relative_to_held_fd(self) -> None:
+        self.baseline()
+        worker = runpy.run_path(str(WORKER), run_name="orderbell_worker_cleanup_test")
+        state = self.state_json()
+        state["failureCount"] = 1
+        original = self.state_path().read_bytes()
+        real_open = worker["os"].open
+        real_fsync = worker["os"].fsync
+        real_unlink = worker["os"].unlink
+        temporary_directory_fd: int | None = None
+        cleanups: list[tuple[str, int | None]] = []
+
+        def traced_open(
+            path: Any,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal temporary_directory_fd
+            opened = real_open(path, flags, mode, dir_fd=dir_fd)
+            if isinstance(path, str) and path.startswith(".orderbell-"):
+                temporary_directory_fd = dir_fd
+            return opened
+
+        def fail_file_fsync(fd: int) -> None:
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, "synthetic state fsync failure")
+            real_fsync(fd)
+
+        def traced_unlink(path: str, *, dir_fd: int | None = None) -> None:
+            cleanups.append((path, dir_fd))
+            real_unlink(path, dir_fd=dir_fd)
+
+        with (
+            mock.patch.dict(worker["os"].environ, self.env, clear=True),
+            mock.patch.object(worker["os"], "open", side_effect=traced_open),
+            mock.patch.object(worker["os"], "fsync", side_effect=fail_file_fsync),
+            mock.patch.object(worker["os"], "unlink", side_effect=traced_unlink),
+            self.assertRaises(worker["WorkerError"]) as caught,
+        ):
+            worker["write_state"](STORE, state)
+
+        self.assertEqual(caught.exception.code, "state_io")
+        self.assertTrue(caught.exception.retryable)
+        self.assertIsNotNone(temporary_directory_fd)
+        self.assertEqual(len(cleanups), 1)
+        self.assertEqual(cleanups[0][1], temporary_directory_fd)
+        self.assertNotIn(os.sep, cleanups[0][0])
+        self.assertEqual(self.state_path().read_bytes(), original)
+        self.assertEqual(list(self.state_path().parent.glob(".orderbell-*.tmp")), [])
+
+    def test_directory_fsync_failure_has_no_temporary_leak(self) -> None:
+        self.baseline()
+        worker = runpy.run_path(str(WORKER), run_name="orderbell_worker_dirsync_test")
+        state = self.state_json()
+        state["failureCount"] = 1
+        real_fsync = worker["os"].fsync
+
+        def fail_directory_fsync(fd: int) -> None:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, "synthetic directory fsync failure")
+            real_fsync(fd)
+
+        with (
+            mock.patch.dict(worker["os"].environ, self.env, clear=True),
+            mock.patch.object(worker["os"], "fsync", side_effect=fail_directory_fsync),
+            self.assertRaises(worker["WorkerError"]) as caught,
+        ):
+            worker["write_state"](STORE, state)
+
+        self.assertEqual(caught.exception.code, "state_io")
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(self.state_json()["failureCount"], 1)
+        self.assertEqual(list(self.state_path().parent.glob(".orderbell-*.tmp")), [])
+
+    def test_zero_length_state_write_fails_without_looping_or_leaking(self) -> None:
+        self.baseline()
+        worker = runpy.run_path(str(WORKER), run_name="orderbell_worker_zero_write_test")
+        state = self.state_json()
+        state["failureCount"] = 1
+        original = self.state_path().read_bytes()
+
+        with (
+            mock.patch.dict(worker["os"].environ, self.env, clear=True),
+            mock.patch.object(worker["os"], "write", return_value=0),
+            self.assertRaises(worker["WorkerError"]) as caught,
+        ):
+            worker["write_state"](STORE, state)
+
+        self.assertEqual(caught.exception.code, "state_io")
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(self.state_path().read_bytes(), original)
+        self.assertEqual(list(self.state_path().parent.glob(".orderbell-*.tmp")), [])
+
     def test_hardlinked_lock_is_refused_without_modifying_its_target(self) -> None:
         lock_root = self.runtime / "orderbell"
         lock_root.mkdir(mode=0o700)
@@ -1660,17 +2021,36 @@ class WorkerIntegrationTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             env=environment,
         )
-        deadline = time.monotonic() + 5
-        while not pid_file.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        self.assertTrue(pid_file.exists(), "fake Shopify child did not start")
-        child_pid = int(pid_file.read_text(encoding="ascii"))
-        process.send_signal(signal.SIGTERM)
-        stdout, stderr = process.communicate(timeout=5)
+        child_pid: int | None = None
+        try:
+            deadline = time.monotonic() + 5
+            while child_pid is None and time.monotonic() < deadline:
+                try:
+                    candidate = pid_file.read_text(encoding="ascii").strip()
+                    if candidate:
+                        parsed = int(candidate)
+                        if parsed > 1:
+                            child_pid = parsed
+                except (FileNotFoundError, ValueError):
+                    pass
+                if child_pid is None:
+                    time.sleep(0.02)
+            self.assertIsNotNone(child_pid, "fake Shopify child did not publish a valid PID")
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate(timeout=5)
         self.assertEqual(stderr, b"")
         self.assertEqual(process.returncode, 130)
         result = json.loads(stdout)
         self.assertEqual(result["error"]["code"], "interrupted")
+        assert child_pid is not None
         with self.assertRaises(ProcessLookupError):
             os.kill(child_pid, 0)
 

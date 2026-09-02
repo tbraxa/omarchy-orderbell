@@ -4,6 +4,18 @@ All notable changes to OrderBell are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-02
+
+### Security
+
+- Hardened durable state saves against directory and target time-of-check/time-of-use changes. The writer now holds and verifies a no-follow state-directory descriptor, creates an exclusive no-follow owner-only temporary entry, performs replacement and cleanup relative to that descriptor, verifies the temporary and installed inode bindings, and syncs both file and directory before accepting the save.
+- Removed the automatically discovered `AGENTS.md` instruction surface from the distributable repository. Contributor guidance now points to the ordinary normative security, privacy, architecture, and test documents, and CI rejects any tracked case-insensitive `AGENTS.md` at any path.
+
+### Changed
+
+- Pinned the worker CI runtime to Python 3.11 through an immutable `actions/setup-python` revision so the documented minimum Python version is exercised directly.
+- Removed a PID-publication race from the SIGTERM/reaping regression test and guaranteed cleanup on an early assertion failure, preventing a test-only child process leak.
+
 ## [0.1.1] - 2026-09-02
 
 ### Security
@@ -44,6 +56,7 @@ All notable changes to OrderBell are documented here. The format follows [Keep a
 - Guaranteed child termination and reaping if selector setup fails after a subprocess starts.
 - Updated CI actions to reviewed Node 24 revisions pinned by full commit SHA.
 
-[Unreleased]: https://github.com/tbraxa/omarchy-orderbell/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/tbraxa/omarchy-orderbell/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/tbraxa/omarchy-orderbell/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/tbraxa/omarchy-orderbell/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/tbraxa/omarchy-orderbell/releases/tag/v0.1.0

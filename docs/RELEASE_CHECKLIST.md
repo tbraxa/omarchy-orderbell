@@ -22,10 +22,12 @@ This checklist is a gate, not a claim that publication is complete. The version 
 
 - [ ] `python3 -m compileall -q bin tests`
 - [ ] `python3 -m unittest discover -s tests -p 'test_worker*.py'`
+- [ ] CI configures Python 3.11 from a full-SHA-pinned action and the complete worker suite passes on that minimum supported runtime.
 - [ ] `node --test tests/model.test.mjs`
 - [ ] `tests/run-qml`
 - [ ] Qt 6 QML parse/lint checks are green or every type-information-only diagnostic is reviewed without blanket suppression.
 - [ ] Manifest/repository validation job is green.
+- [ ] Repository-shape validation proves no tracked basename case-insensitively equals `AGENTS.md`, at any path.
 - [ ] Secret scan is green on the full history and release worktree.
 - [ ] No test is skipped, retried to green, network-dependent, timezone-dependent, or flaky.
 - [ ] Failure-injection matrix in `docs/TEST_PLAN.md` is covered and mapped to test names.
@@ -33,9 +35,9 @@ This checklist is a gate, not a claim that publication is complete. The version 
 
 ## 4. Security and privacy review
 
-- [ ] Two-person review (or an independent reviewer) covers subprocess argv, store validation, response bounds, pagination, state transitions, symlink handling, notification sanitization, URL construction, and error redaction.
+- [ ] Two-person review (or an independent reviewer) covers subprocess argv, store validation, response bounds, pagination, state transitions, descriptor-relative state writes and swap/failure paths, notification sanitization, URL construction, and error redaction.
 - [ ] Token/PII canary fixtures prove secrets and prohibited fields never appear in stdout, state, notifications, error messages, or logs.
-- [ ] Directory/file modes and atomic write behavior verified on the release filesystem.
+- [ ] On the release filesystem, state writes are verified to hold the expected owner-private no-follow directory descriptor, create an exclusive/no-follow owner-only temporary, replace and clean up relative to that descriptor, verify directory/temporary/installed inode bindings, and synchronize file then directory; swap and post-replacement synchronization failures fail closed with the documented durability ambiguity.
 - [ ] Corrupt-state recovery instructions move one exact hashed file to a private backup, never delete automatically, and disclose the next quiet baseline.
 - [ ] Threat model, data map, privacy notice, security policy, and worker protocol match code field-for-field.
 - [ ] Static marketplace security-baseline scan has no blocking finding; any review capability is understood and recorded.

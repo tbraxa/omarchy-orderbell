@@ -31,14 +31,11 @@ CI tests use fake `shopify`, `omarchy`, and `xdg-open` executables plus syntheti
 
 ## Change rules
 
-- Read `AGENTS.md`, `SECURITY.md`, `PRIVACY.md`, and `docs/ARCHITECTURE.md` before editing runtime behavior.
-- Keep the scope exactly `read_orders`; write behavior belongs in a different product and is not accepted here.
-- Preserve argument-array subprocess execution and strict canonical store validation.
-- Treat GraphQL/CLI output as hostile and bounded.
-- Update tests with every behavior change, including negative and recovery cases.
+- Treat the invariants in `SECURITY.md` as the normative security contract. Read it together with `docs/THREAT_MODEL.md` before editing runtime behavior; do not weaken those boundaries in implementation, tests, documentation, or release material.
+- Treat `PRIVACY.md` and `docs/DATA_MAP.md` as the normative data-handling contract. A new field, retention rule, or destination requires all affected privacy, threat-model, architecture, and test documentation to change with the implementation.
+- Use the delivery, concurrency, and durability invariants in `docs/ARCHITECTURE.md` and the cases in `docs/TEST_PLAN.md` as acceptance criteria. Update deterministic tests with every behavior change, including relevant negative, interruption, and recovery paths.
 - Use Omarchy semantic theme tokens and native components. Do not hard-code a private theme's colors or modify `/usr/share/omarchy`.
 - Use a generic commerce icon. Do not add Shopify logos, product screenshots, or trade dress without documented permission.
-- Do not weaken privacy mode, persist new fields, or add a network destination without updating the data map, threat model, privacy notice, and tests.
 - Do not claim a live Shopify test occurred unless release evidence records the tester, UTC time, commit, environment, exact read-only scenario, and result—without exposing store or order data. Never create or modify a production order for acceptance testing.
 
 ## Pull requests

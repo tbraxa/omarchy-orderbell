@@ -16,6 +16,8 @@ Run:
 python3 -m unittest discover -s tests -p 'test_worker*.py'
 ```
 
+CI pins Python 3.11 for compilation and the complete worker suite so the minimum supported runtime is exercised directly. Passing only on a newer distribution-default Python would not evidence the stated minimum.
+
 Required coverage areas:
 
 - canonical store parser: accepted boundary values and rejection of schemes, paths, ports, queries, fragments, user info, uppercase, Unicode lookalikes, IP literals, invalid labels, whitespace tricks, controls, and overlong names;
@@ -30,7 +32,8 @@ Required coverage areas:
 - deterministic deduplication and at-least-once pending-delivery recovery around every durable transition;
 - six-hour `catching_up` chunks, the 59-day fail-closed horizon, the 20 × 100 edge ceiling, and backward-clock recovery;
 - 64-entry outbox validation/compaction, `pendingCount` queue-entry semantics, one shared five-attempt budget across pre-fetch restart recovery and post-fetch delivery, eight failures per entry, and durable `notify=false`/test-filter cleanup (outbox, test rows, split unread contribution) before either delivery or network access;
-- state schema validation, contextual malformed/deep/extreme JSON and timestamp failure classification, corrupt-state rejection without automatic overwrite plus fail-closed preservation, atomic replacement, permissions, XDG fallbacks, disk/full/permission errors, symlinks, and concurrent per-store locking;
+- state schema validation, contextual malformed/deep/extreme JSON and timestamp failure classification, corrupt-state rejection without automatic overwrite plus fail-closed preservation, permissions, XDG fallbacks, disk/full/permission errors, and concurrent per-store locking;
+- descriptor-relative state-write transactions: no-follow verified directory opening, exclusive/no-follow temporary creation, file and directory synchronization, target/temporary/installed-inode and directory-binding checks, atomic replacement and failure cleanup through the held descriptor; inject directory, target and temporary swaps plus zero-byte writes and synchronization failures, and prove no attacker-selected external target is followed or modified;
 - restart, suspend-like long gaps, backward/forward clock jumps, midnight, leap day, and daylight-saving transitions;
 - privacy-mode panel and notification text, sanitization, length caps, action URL construction, and exclusion of every prohibited data field;
 - bounded worker JSON protocol for `poll`, `status`, and `mark-read`.
@@ -64,6 +67,7 @@ Service regressions include exit-code/envelope consistency, abnormal exit, `Fail
 - parse `manifest.json` as strict JSON;
 - require exact schema version, permanent plugin ID, semantic version, both kinds and existing safe relative entry points;
 - validate setting defaults/types/ranges and reject symlinks;
+- reject any tracked file whose basename case-insensitively equals `AGENTS.md`, at the root or below it;
 - run `omarchy plugin validate .` on Omarchy 4;
 - scan repository history/worktree for secrets and forbidden shell/privilege/download patterns;
 - verify documentation links and the declared runtime dependency set.
@@ -93,6 +97,11 @@ Service regressions include exit-code/envelope consistency, abnormal exit, `Fail
 | Shopify throttle | Respect bounded retry/backoff signal; no tight loop |
 | State file corrupted | No unsafe overwrite or historical flood; the documented owner-only backup/rebaseline procedure provides the explicit recovery path and discloses the next quiet baseline |
 | State path is a symlink | Refuse operation without following target |
+| Store-state directory path is replaced after its verified descriptor is opened | Transaction remains anchored to the held directory; an attacker-selected replacement directory receives no state or cleanup operation; binding verification fails closed |
+| Existing state target is replaced with a symlink after validation | Descriptor-relative atomic replacement replaces the directory entry without following the link; the link target is unchanged and the installed regular state is verified |
+| Temporary directory entry is replaced before its pre-replacement verification | Descriptor/inode comparison rejects the save, preserves the prior target, and removes the changed temporary entry only through the held directory descriptor; a later same-user race is detected by installed-inode verification but can leave a changed on-disk outcome |
+| Installed target is changed immediately after replacement | Post-replacement inode verification reports `unsafe_state`; no attacker-selected link target is followed or modified |
+| State file or directory synchronization fails, or a write returns zero bytes | Bounded `state_io` failure with no temporary leak; a post-replacement failure may leave the validated new state visible while crash durability remains unconfirmed |
 | Two workers poll one store | One owns lock; second emits `busy` without API request |
 | More than five notification entries await delivery | At most five commands run; remaining queue entries stay durable and `pendingCount` counts entries, not represented orders |
 | One notification entry fails eight times | No ninth delivery command; explicit non-retryable retry-limit status and durable pending entry |

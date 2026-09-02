@@ -2,7 +2,7 @@
 
 ## Scope
 
-OrderBell `0.1.1` is one Omarchy service plus one bar widget backed by a short-lived local worker. It reads recent Shopify orders, determines which are newly observed, keeps minimal durable delivery state, and asks Omarchy to show notifications. It does not run a separate daemon or receive inbound traffic.
+OrderBell `0.1.2` is one Omarchy service plus one bar widget backed by a short-lived local worker. It reads recent Shopify orders, determines which are newly observed, keeps minimal durable delivery state, and asks Omarchy to show notifications. It does not run a separate daemon or receive inbound traffic.
 
 ```text
 Omarchy shell (long-lived)
@@ -16,7 +16,7 @@ bin/orderbell-worker (short-lived Python stdlib process)
   ├─ acquires one per-store runtime lock
   ├─ invokes official Shopify CLI with fixed argv
   ├─ validates the shop display name and paginates a GraphQL response
-  ├─ updates owner-only state atomically
+  ├─ updates owner-only state through a verified descriptor-relative transaction
   └─ invokes Omarchy notification CLI with fixed argv
            │                         │
            ▼                         ▼
@@ -63,7 +63,7 @@ The GraphQL query requests only fields required by the data map: `shop.name` plu
 
 ### Durable state and delivery
 
-State is namespaced per store using SHA-256 of the canonical domain. It retains the validated canonical domain and a sanitized Shopify shop display name (or `null` before the first successful poll). Durable data lives under `${XDG_STATE_HOME:-$HOME/.local/state}/orderbell/stores/`; runtime locks live below `${XDG_RUNTIME_DIR}/orderbell/`. Store operations refuse symlinked directories and files, use owner-only permissions, and replace state atomically.
+State is namespaced per store using SHA-256 of the canonical domain. It retains the validated canonical domain and a sanitized Shopify shop display name (or `null` before the first successful poll). Durable data lives under `${XDG_STATE_HOME:-$HOME/.local/state}/orderbell/stores/`; runtime locks live below `${XDG_RUNTIME_DIR}/orderbell/`. A save holds an owner-private state-directory descriptor opened with no-follow semantics and verifies its device/inode binding against the expected path. The worker creates a random temporary entry with exclusive/no-follow flags relative to that descriptor, writes and synchronizes it through the open file descriptor, revalidates the target, temporary inode and directory binding, then uses descriptor-relative atomic replacement. It verifies that the installed target is the inode it wrote before and after the directory synchronization; failure cleanup is also descriptor-relative. This prevents a pathname-component swap from redirecting an in-progress transaction after the directory descriptor is established, but it is not a sandbox against an unrestricted same-user process.
 
 Correctness follows these invariants:
 
@@ -139,7 +139,7 @@ The UI uses Omarchy native components and semantic tokens for background, foregr
 
 The compact layer answers three questions: is polling healthy, are there unread orders, and when was the last successful check? Pending delivery also activates the bar so a queued alert cannot look “all caught up.” The panel adds recent sanitized orders and recovery guidance without exposing customer PII. It shows Shopify's sanitized shop name as the friendly label and the canonical domain separately so presentation never obscures identity. With privacy mode enabled (the default), both the panel and per-order notifications hide order name/number and amount while retaining store and status context. Burst notifications always contain only the shop label (or canonical-domain fallback) and count. Normal alerts request Omarchy's maximum 30-second toast lifetime, respect DND, enter Omarchy history, and never retry merely because human attention cannot be proven; the durable unread badge is the persistent fallback.
 
-## Future webhook relay (not in 0.1.1)
+## Future webhook relay (not in 0.1.2)
 
 True push delivery requires a public HTTPS receiver. A future architecture would be a separate, opt-in product:
 
@@ -153,4 +153,4 @@ Shopify orders/create webhook
 
 It would require Shopify app OAuth/review, protected-customer-data analysis, key rotation, tenant isolation, replay protection, deletion/retention controls, operational monitoring, incident response, and a documented service operator. Webhooks alone cannot replace reconciliation because delivery can be duplicated, delayed, or missed.
 
-None of that code, infrastructure, authentication, or network traffic exists in `0.1.1`. It must not be silently added behind the local plugin's settings.
+None of that code, infrastructure, authentication, or network traffic exists in `0.1.2`. It must not be silently added behind the local plugin's settings.
