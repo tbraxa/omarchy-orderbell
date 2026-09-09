@@ -27,6 +27,8 @@ You should receive acknowledgment within 72 hours. No disclosure deadline is pro
 
 ## Security invariants
 
+In 0.1.3, inclusive polling bounds are normalized down to whole UTC seconds before query construction. Validation and checkpointing use those exact same bounds; no acceptance tolerance is added. Fractional legacy checkpoints remain supported without state deletion. All invariants below remain in force.
+
 Every change must preserve these boundaries:
 
 1. The only requested Shopify scope is `read_orders`. Never request a write scope, `read_reports`, or `read_all_orders`.

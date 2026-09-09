@@ -2,6 +2,8 @@
 
 ## Scope
 
+Version 0.1.3 preserves the architecture below and normalizes every polling window to whole-second UTC boundaries before querying. Both endpoints are rounded down; the same endpoints drive strict page validation and durable checkpointing. Existing fractional checkpoints remain readable. Lower-bound rounding adds less than one second of replay coverage, and the upper fractional tail is covered by the next overlapping poll. No state reset or protocol migration is needed.
+
 OrderBell `0.1.2` is one Omarchy service plus one bar widget backed by a short-lived local worker. It reads recent Shopify orders, determines which are newly observed, keeps minimal durable delivery state, and asks Omarchy to show notifications. It does not run a separate daemon or receive inbound traffic.
 
 ```text

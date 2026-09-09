@@ -6,7 +6,9 @@ OrderBell is an unofficial, read-only Omarchy plugin that checks Shopify for new
 
 ![OrderBell setup panel](preview.png)
 
-## What version 0.1.2 does
+## What version 0.1.3 does
+
+Version 0.1.3 fixes a synchronization stall reported as `Shopify returned an order outside OrderBell's bounded polling window.` Existing state is preserved and synchronization resumes after updating and restarting the shell. Do not delete the state or re-authenticate to work around this timestamp-precision bug. Search, validation, and checkpoints now use identical whole-second UTC bounds while retaining strict out-of-window rejection.
 
 - Polls one or more stores through the official Shopify CLI, using the GraphQL Admin API version `2026-07`.
 - Requests only the `read_orders` scope.
@@ -22,7 +24,7 @@ OrderBell does **not** edit orders, fulfill orders, manage themes, run an inboun
 
 ## Local polling, not a webhook service
 
-The implemented `0.1.2` architecture is local polling. While the plugin is enabled and the desktop session is running, it checks each configured store every 60 seconds by default. A notification can therefore arrive up to one polling interval after Shopify records the order; it will wait longer while the notebook is asleep, offline, or logged out.
+The implemented `0.1.3` architecture is local polling. While the plugin is enabled and the desktop session is running, it checks each configured store every 60 seconds by default. A notification can therefore arrive up to one polling interval after Shopify records the order; it will wait longer while the notebook is asleep, offline, or logged out.
 
 Each check starts the official Shopify CLI as a short-lived process. There is no permanent OrderBell worker, but CLI startup can create a brief CPU and memory burst. On a resource-sensitive notebook, increasing **Check every** to 120–300 seconds reduces that work proportionally in exchange for the same additional notification latency.
 
@@ -220,6 +222,7 @@ The implementation, review boundaries, and release gates are intentionally publi
 - [Test plan](docs/TEST_PLAN.md)
 - [Release checklist](docs/RELEASE_CHECKLIST.md)
 - [0.1.2 release evidence](docs/RELEASE_EVIDENCE_0.1.2.md)
+- [0.1.3 release evidence](docs/RELEASE_EVIDENCE_0.1.3.md)
 - [0.1.1 release evidence](docs/RELEASE_EVIDENCE_0.1.1.md)
 - [0.1.0 release evidence](docs/RELEASE_EVIDENCE_0.1.0.md)
 - [Contributing](CONTRIBUTING.md)

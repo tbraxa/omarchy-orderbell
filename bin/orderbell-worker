@@ -1357,9 +1357,22 @@ def fetch_orders(
     return sorted(all_orders.values(), key=lambda order: (order.created_dt, order.gid)), display_name
 
 
+def _second_window(since: dt.datetime, until: dt.datetime, catching_up: bool) -> PollWindow:
+    # Shopify search can return the whole-second boundary for a fractional
+    # lower bound. Use the SAME whole-second window for search, validation and
+    # checkpointing. Floor the lower bound to preserve coverage; floor the upper
+    # bound so we never checkpoint time that was not queried. The overlap and
+    # identity dedupe cover the deferred fractional second on the next poll.
+    return PollWindow(
+        since.astimezone(dt.timezone.utc).replace(microsecond=0),
+        until.astimezone(dt.timezone.utc).replace(microsecond=0),
+        catching_up,
+    )
+
+
 def _poll_window(state: dict[str, Any], started: dt.datetime) -> PollWindow:
     if not state["initialized"]:
-        return PollWindow(started - OVERLAP, started, False)
+        return _second_window(started - OVERLAP, started, False)
 
     watermark, _ = parse_timestamp(state["watermarkCreatedAt"], field="watermark")
     if watermark <= started:
@@ -1371,7 +1384,7 @@ def _poll_window(state: dict[str, Any], started: dt.datetime) -> PollWindow:
                 retryable=False,
             )
         until = min(started, watermark + MAX_CATCHUP_SPAN)
-        return PollWindow(watermark - OVERLAP, until, until < started)
+        return _second_window(watermark - OVERLAP, until, until < started)
 
     # A saved checkpoint in the local future means the wall clock moved
     # backwards after an earlier poll.  Rewind conservatively by the same skew
@@ -1386,7 +1399,7 @@ def _poll_window(state: dict[str, Any], started: dt.datetime) -> PollWindow:
         )
     recovery_start = started - skew
     until = min(started, recovery_start + MAX_CATCHUP_SPAN)
-    return PollWindow(recovery_start - OVERLAP, until, True)
+    return _second_window(recovery_start - OVERLAP, until, True)
 
 
 def _status_words(value: str | None) -> str:

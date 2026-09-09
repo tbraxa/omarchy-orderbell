@@ -1858,14 +1858,14 @@ class WorkerIntegrationTests(unittest.TestCase):
         checkpoint = dt.datetime.fromisoformat(
             self.state_json()["watermarkCreatedAt"].replace("Z", "+00:00")
         )
-        self.assertEqual(checkpoint, old_watermark + dt.timedelta(hours=6))
+        self.assertEqual(checkpoint, (old_watermark + dt.timedelta(hours=6)).replace(microsecond=0))
         argv = self.log_lines(self.shopify_log)[-1]
         variables = json.loads(argv[argv.index("--variables") + 1])
         expected_since = (old_watermark - dt.timedelta(minutes=5)).isoformat(
-            timespec="microseconds"
+            timespec="seconds"
         ).replace("+00:00", "Z")
         expected_until = (old_watermark + dt.timedelta(hours=6)).isoformat(
-            timespec="microseconds"
+            timespec="seconds"
         ).replace("+00:00", "Z")
         self.assertEqual(
             variables["query"],
@@ -1884,8 +1884,69 @@ class WorkerIntegrationTests(unittest.TestCase):
         recovered_checkpoint = dt.datetime.fromisoformat(
             self.state_json()["watermarkCreatedAt"].replace("Z", "+00:00")
         )
-        self.assertGreaterEqual(recovered_checkpoint, before)
+        self.assertGreaterEqual(recovered_checkpoint, before.replace(microsecond=0))
         self.assertLessEqual(recovered_checkpoint, after)
+
+    def test_fractional_windows_use_whole_seconds_for_every_recovery_path(self) -> None:
+        worker = runpy.run_path(str(WORKER))
+        started = dt.datetime(2026, 1, 2, 0, 0, 0, 654321, tzinfo=dt.timezone.utc)
+        for lag in (None, dt.timedelta(minutes=2), dt.timedelta(hours=7), -dt.timedelta(hours=2)):
+            with self.subTest(lag=lag):
+                state = worker["default_state"](STORE)
+                if lag is not None:
+                    state["initialized"] = True
+                    state["watermarkCreatedAt"] = worker["iso_utc"](started - lag)
+                window = worker["_poll_window"](state, started)
+                self.assertEqual(window.since.microsecond, 0)
+                self.assertEqual(window.until.microsecond, 0)
+                self.assertLessEqual(window.until, started)
+                self.assertLessEqual(window.until - window.since, dt.timedelta(hours=6, minutes=5))
+                for boundary in (window.since, window.until):
+                    payload = json.dumps(page([order(901, created_at=worker["iso_utc"](boundary))])).encode()
+                    worker["parse_page"](payload, STORE, window.since, window.until)
+                for outside in (window.since - dt.timedelta(microseconds=1), window.until + dt.timedelta(microseconds=1)):
+                    payload = json.dumps(page([order(902, created_at=worker["iso_utc"](outside))])).encode()
+                    with self.assertRaises(worker["WorkerError"]) as caught:
+                        worker["parse_page"](payload, STORE, window.since, window.until)
+                    self.assertEqual(caught.exception.code, "search_filter_violation")
+
+    def test_fractional_legacy_checkpoint_recovers_without_replay_or_skipped_tail(self) -> None:
+        worker = runpy.run_path(str(WORKER))
+        started = dt.datetime(2026, 1, 2, 12, 2, 0, 654321, tzinfo=dt.timezone.utc)
+        state = worker["default_state"](STORE)
+        state["initialized"] = True
+        state["watermarkCreatedAt"] = "2026-01-02T12:00:00.535475Z"
+        state["failureCount"] = 9
+        options = worker["parse_cli"](["poll", "--store", STORE, "--notify"])
+        lower = order(911, created_at="2026-01-02T11:55:00Z")
+        recent = order(912, created_at="2026-01-02T12:01:50Z")
+        tail = order(913, created_at="2026-01-02T12:02:00.500000Z")
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.dict(
+            worker["poll"].__globals__, {"utc_now": lambda: started}
+        ):
+            worker["write_state"](STORE, state)
+            self.set_execute(page([lower, recent]))
+            result, code = worker["poll"](options)
+            self.assertEqual(code, 0)
+            self.assertIsNone(result["error"])
+            self.assertEqual(result["unreadCount"], 2)
+            saved = worker["read_state"](STORE)
+            self.assertEqual(saved["watermarkCreatedAt"], "2026-01-02T12:02:00Z")
+            self.assertEqual(saved["failureCount"], 0)
+            argv = self.log_lines(self.shopify_log)[-1]
+            variables = json.loads(argv[argv.index("--variables") + 1])
+            self.assertEqual(variables["query"], "created_at:>='2026-01-02T11:55:00Z' AND created_at:<='2026-01-02T12:02:00Z'")
+            started += dt.timedelta(seconds=1)
+            self.set_execute(page([recent, tail]))
+            result, code = worker["poll"](options)
+            self.assertEqual(code, 0)
+            self.assertIsNone(result["error"])
+            self.assertEqual(result["unreadCount"], 3)
+            self.assertEqual(len(self.log_lines(self.omarchy_log)), 3)
+            result, code = worker["poll"](options)
+            self.assertEqual(code, 0)
+            self.assertEqual(result["unreadCount"], 3)
+            self.assertEqual(len(self.log_lines(self.omarchy_log)), 3)
 
     def test_poll_windows_are_deterministic_across_midnight_dst_and_clock_jumps(self) -> None:
         worker = runpy.run_path(str(WORKER), run_name="orderbell_worker_time_tests")

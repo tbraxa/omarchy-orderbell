@@ -4,6 +4,17 @@ All notable changes to OrderBell are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-09
+
+### Fixed
+
+- Fixed a persistent `search_filter_violation` when Shopify returns an order on the whole-second lower boundary of a fractional polling window. Search variables, strict response validation, and durable checkpoints now share the same whole-second UTC window. The lower bound is rounded down to preserve coverage and the upper bound is rounded down to avoid checkpointing unqueried time.
+- Existing fractional checkpoints recover automatically without deleting state, re-authenticating, or establishing a new quiet baseline. Identity deduplication and all out-of-window, pagination, timeout, and state-write protections remain enabled.
+
+### Tests
+
+- Added synthetic regressions for fractional baseline, normal polling, catch-up and backward-clock windows; exact boundary acceptance; rejection one microsecond outside either bound; recovery from an existing failed checkpoint; deferred fractional-second coverage; and no duplicate notification on re-poll.
+
 ## [0.1.2] - 2026-09-02
 
 ### Security

@@ -8,6 +8,8 @@ The model applies to OrderBell `0.1.2` running under an ordinary user in an Omar
 
 ## Assets
 
+The 0.1.3 timestamp-precision fix retains these boundaries. It aligns query, validation and checkpoint bounds to whole UTC seconds rather than relaxing response validation. Fractional legacy checkpoints receive less than one extra second of lower-bound overlap; strict upper-bound rejection, identity deduplication, pagination limits and state durability are unchanged.
+
 | Asset | Required property |
 | --- | --- |
 | Shopify CLI session/token | Never read, copy, log, display, or persist it in OrderBell. |
