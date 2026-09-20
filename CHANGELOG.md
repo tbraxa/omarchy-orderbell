@@ -4,6 +4,14 @@ All notable changes to OrderBell are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-20
+
+### Fixed
+
+- Recognize mise's unavailable `shopify` shim as `dependency_missing`, with a sanitized actionable message that distinguishes local runtime setup from store authentication. The checkpoint is preserved for recovery.
+- Document a separate, explicitly versioned mise npm-tool installation of official Shopify CLI, preventing its loss when switching Node installations. Existing global npm installations require this one-time manual migration; the plugin does not install or repair dependencies automatically.
+- Add regression coverage for missing-shim redaction, checkpoint preservation, resumed order detection and no duplicate notification after dependency restoration.
+
 ## [0.1.3] - 2026-09-09
 
 ### Fixed

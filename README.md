@@ -6,7 +6,9 @@ OrderBell is an unofficial, read-only Omarchy plugin that checks Shopify for new
 
 ![OrderBell setup panel](preview.png)
 
-## What version 0.1.3 does
+## What version 0.1.4 does
+
+Version 0.1.4 documents a Node-upgrade-safe Shopify CLI installation for mise users and identifies a missing Shopify mise shim as a local dependency problem instead of a generic Shopify query failure. Updating the plugin alone does not migrate an existing global npm installation: complete the one-time setup below. The plugin never installs packages itself.
 
 Version 0.1.3 fixes a synchronization stall reported as `Shopify returned an order outside OrderBell's bounded polling window.` Existing state is preserved and synchronization resumes after updating and restarting the shell. Do not delete the state or re-authenticate to work around this timestamp-precision bug. Search, validation, and checkpoints now use identical whole-second UTC bounds while retaining strict out-of-window rejection.
 
@@ -39,7 +41,19 @@ A future real-time edition could use a separately deployed, authenticated webhoo
 - The official Shopify CLI 4.0 or newer, available as `shopify` on `PATH`.
 - A Shopify owner or staff account that can grant `read_orders` for each configured store.
 
-OrderBell does not install or upgrade any of these dependencies. Install Shopify CLI only from Shopify's [official installation instructions](https://shopify.dev/docs/api/shopify-cli#installation), then verify its version:
+OrderBell does not install or upgrade any of these dependencies. Shopify CLI is distributed as the official `@shopify/cli` package. On Omarchy with mise-managed Node, use mise's separate npm-tool installation rather than `npm install -g` inside a particular Node version:
+
+```bash
+mise use -g npm:@shopify/cli@4.7.0
+mise exec -- shopify version
+mise which shopify
+```
+
+`4.7.0` is the CLI version tested with this release, not a claim that it is the newest version. Node must also be configured and installed; retain your existing supported Node configuration. [mise's npm backend](https://mise.jdx.dev/dev-tools/backends/npm.html) stores this CLI separately from Node's version-specific global packages. The resolved path should be under a separate `npm-shopify-cli` installation, not `installs/node/<version>/bin/shopify`. Keep mise's shims on the desktop session's `PATH`. Restart the Omarchy shell after migrating with `omarchy restart shell`.
+
+This fixes disappearance of the CLI after switching Node versions; it does not guarantee compatibility with every future Node or Shopify release. Review CLI upgrades separately, then verify a real read-only OrderBell poll. Existing store authentication and state are retained. Do not delete state or re-authenticate for a missing runtime dependency. After an outage, the existing bounded catch-up process resumes from the saved checkpoint and may notify about orders from the missed period.
+
+For systems not using mise, follow Shopify's [official installation instructions](https://shopify.dev/docs/api/shopify-cli#installation) and ensure the CLI remains available to the desktop after runtime updates. Verify its version:
 
 ```bash
 shopify version
@@ -223,6 +237,7 @@ The implementation, review boundaries, and release gates are intentionally publi
 - [Release checklist](docs/RELEASE_CHECKLIST.md)
 - [0.1.2 release evidence](docs/RELEASE_EVIDENCE_0.1.2.md)
 - [0.1.3 release evidence](docs/RELEASE_EVIDENCE_0.1.3.md)
+- [0.1.4 release evidence](docs/RELEASE_EVIDENCE_0.1.4.md)
 - [0.1.1 release evidence](docs/RELEASE_EVIDENCE_0.1.1.md)
 - [0.1.0 release evidence](docs/RELEASE_EVIDENCE_0.1.0.md)
 - [Contributing](CONTRIBUTING.md)

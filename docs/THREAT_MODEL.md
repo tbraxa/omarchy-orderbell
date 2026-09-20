@@ -21,6 +21,8 @@ The 0.1.3 timestamp-precision fix retains these boundaries. It aligns query, val
 
 ## Trust boundaries
 
+Version 0.1.4 documents owner-managed mise npm-tool installation to keep Shopify CLI separate from individual Node installations. Missing-shim diagnostics remain sanitized and never become an installer, shell command, automatic fallback or credential operation. Runtime compatibility, PATH integrity and dependency updates remain host responsibilities.
+
 1. **Omarchy settings → QML:** store strings and booleans are untrusted configuration.
 2. **QML → worker:** command-line values are untrusted even when previously validated.
 3. **Worker → Shopify CLI:** executable lookup and the same-user environment are host trust dependencies.

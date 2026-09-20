@@ -991,6 +991,13 @@ def run_bounded(
 
 def classify_cli_failure(result: CommandResult) -> WorkerError:
     diagnostic = result.stderr.decode("utf-8", "replace").lower()
+    if "mise" in diagnostic and "no version is set for shim: shopify" in diagnostic:
+        return WorkerError(
+            "dependency_missing",
+            "Shopify CLI is unavailable for the active Node runtime. "
+            "Follow the README's mise setup; reconnecting the store will not fix this.",
+            retryable=False,
+        )
     authentication_terms = (
         "unauthorized",
         "not authenticated",

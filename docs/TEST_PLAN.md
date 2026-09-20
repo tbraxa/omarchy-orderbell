@@ -76,6 +76,7 @@ Service regressions include exit-code/envelope consistency, abnormal exit, `Fail
 
 | Scenario | Expected result |
 | --- | --- |
+| mise has no active Shopify shim after a Node change | Sanitized `dependency_missing`, not authentication failure; no checkpoint advance; restored CLI resumes detection without duplicate notification |
 | Fractional checkpoint from 0.1.2 and a whole-second lower-bound order | Query/validation/checkpoint share floored second boundaries; synchronization recovers without resetting state |
 | Order exactly at either normalized boundary / one microsecond outside | Exact boundary accepted; outside rejected without advancing the checkpoint |
 | Deferred upper fractional second and repeated recent order on next poll | Deferred order detected; repeated identity does not increment unread or notify again |

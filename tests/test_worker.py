@@ -1172,6 +1172,7 @@ class WorkerIntegrationTests(unittest.TestCase):
 
     def test_cli_error_classification_and_no_secret_leakage(self) -> None:
         cases = [
+            ("mise ERROR No version is set for shim: shopify shpat_DEPENDENCY_SECRET", "dependency_missing", False),
             ("HTTP 401 unauthorized shpat_AUTH_SECRET", "authentication_required", False),
             ("HTTP 429 throttled shpat_RATE_SECRET", "throttled", True),
             ("HTTP 503 service unavailable shpat_SERVER_SECRET", "shopify_unavailable", True),
@@ -1189,6 +1190,28 @@ class WorkerIntegrationTests(unittest.TestCase):
                 self.assertEqual(result["error"]["retryable"], retryable)
                 self.assertNotIn("shpat_", serialized)
                 self.assertNotIn(diagnostic, serialized)
+
+    def test_missing_mise_shopify_preserves_checkpoint_and_recovers_without_replay(self) -> None:
+        self.baseline()
+        before = self.state_json()["watermarkCreatedAt"]
+        self.set_execute(None, default={
+            "stderr": "mise ERROR No version is set for shim: shopify shpat_SECRET", "exitCode": 1,
+        })
+        process, failed = self.run_worker("poll", "--store", STORE, "--notify")
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(failed["error"]["code"], "dependency_missing")
+        self.assertFalse(failed["error"]["retryable"])
+        self.assertNotIn("shpat_SECRET", json.dumps(failed))
+        self.assertEqual(self.state_json()["watermarkCreatedAt"], before)
+        self.assertEqual(len(self.log_lines(self.omarchy_log)), 0)
+        self.set_execute(page([order(951)]))
+        _, recovered = self.run_worker("poll", "--store", STORE, "--notify")
+        self.assertIsNone(recovered["error"])
+        self.assertEqual(recovered["unreadCount"], 1)
+        self.assertEqual(self.state_json()["failureCount"], 0)
+        _, repeated = self.run_worker("poll", "--store", STORE, "--notify")
+        self.assertEqual(repeated["unreadCount"], 1)
+        self.assertEqual(len(self.log_lines(self.omarchy_log)), 1)
 
     def test_timeout_and_live_output_limit_are_bounded(self) -> None:
         self.set_execute(None, default={"sleep": 2})
